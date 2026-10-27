@@ -4,23 +4,22 @@
 ![python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Realized and implied volatility toolkit, in three layers:
+Volatility of BTC and ETH perpetuals on Deribit: measured live, forecast, and compared with what the options market implies.
 
-1. **Streaming estimators on Deribit.** WebSocket ticks are aggregated into bars and update an O(1) EWMA variance and range-based estimators (Parkinson, Garman-Klass, Yang-Zhang), with DVOL alongside. Public channels only, so no API key is needed.
-2. **Forecast evaluation.** GARCH(1,1) by QMLE with robust standard errors. EWMA, fitted EWMA, GARCH and a historical benchmark are compared out of sample under a walk-forward protocol, with Diebold-Mariano and Mincer-Zarnowitz tests. The DVOL variance risk premium is tested with overlap-robust inference.
-3. **Earnings extension.** For equities with an announcement in the next few weeks, the ATM straddle implied move (and the event-only move extracted from the term structure) is compared with the vol-adjusted historical distribution of announcement moves. P-values are controlled for false discoveries across the universe.
+- **Live monitor.** Streams trades over WebSocket, builds bars, and updates realized-volatility estimators (EWMA, close-to-close with a confidence interval, Parkinson, Garman-Klass, Yang-Zhang) next to DVOL, Deribit's 30-day implied volatility index.
+- **Research report.** Fits a GARCH(1,1) and runs an out-of-sample comparison of variance forecasts. It also tests whether implied volatility overprices realized volatility (the variance risk premium).
 
-Every reported number comes with an interval or a test. Every test was checked for size by simulation (see [Statistical design](#statistical-design)).
+Only Deribit's public API is used, so no account or key is needed. Every reported number comes with an interval or a test, and the tests themselves are checked by simulation (see [Statistical design](#statistical-design)).
 
 ---
 
 ## Results
 
-As of 2026-10-27. Reproduce them with `volengine report BTC-PERPETUAL`.
+As of 2026-10-27. Reproduce them with `volengine report BTC-PERPETUAL` and `volengine report ETH-PERPETUAL`.
 
-### Forecasting daily variance, out of sample
+### Does a more complex model forecast better?
 
-Walk-forward from 2021 with parameters re-estimated every 21 sessions. Each forecast is one step ahead. The proxy is the sum of squared hourly returns over the 08:00 UTC session. The loss is QLIKE (Patton, 2011). DM is the Diebold-Mariano statistic against RiskMetrics (λ = 0.94); a negative value means lower loss.
+Walk-forward from 2021 with parameters re-estimated every 21 sessions. Each forecast is one day ahead. The forecast target is the sum of squared hourly returns over the 08:00 UTC session (Deribit's settlement time). The loss is QLIKE (Patton, 2011). DM is the Diebold-Mariano statistic against RiskMetrics (λ = 0.94); a negative value means lower loss.
 
 | | BTC QLIKE | BTC DM (p) | ETH QLIKE | ETH DM (p) |
 |---|---:|---:|---:|---:|
@@ -29,42 +28,32 @@ Walk-forward from 2021 with parameters re-estimated every 21 sessions. Each fore
 | EWMA λ fitted (QLIKE) | 0.451 | +0.96 (0.34) | 0.446 | −0.42 (0.67) |
 | GARCH(1,1) | 0.466 | +1.16 (0.24) | **0.443** | −0.27 (0.79) |
 
-- The rolling historical estimator is significantly worse than any conditional model.
-- **Neither GARCH nor a fitted EWMA beats RiskMetrics with statistical significance**, on either asset. At this horizon, extra parameters buy nothing detectable. That is consistent with Hansen & Lunde (2005).
-- GARCH forecasts are biased: the Mincer-Zarnowitz test of a = 0, b = 1 is rejected (p < 0.001) even though GARCH has the highest R². The EWMA forecasts are not rejected.
+- A rolling historical estimator is significantly worse than any conditional model.
+- Neither GARCH nor a fitted EWMA beats RiskMetrics with statistical significance, on either asset.
+- GARCH forecasts are also biased: the Mincer-Zarnowitz test is rejected at p < 0.001 even though GARCH has the highest R². The EWMA forecasts are not rejected.
 
-On BTC, the in-sample GARCH(1,1) fit gives persistence α + β = 0.968, a half-life of 21 sessions, and clean Ljung-Box and ARCH-LM tests on the squared standardized residuals. However, the robust standard error on α is **7× the classical one** (0.196 against 0.028). With Gaussian errors, α looks highly significant; with robust errors, it does not. Most of the information comes from a handful of extreme days (−34% on 2020-03-12, Jarque-Bera ≈ 6300). This is why robust errors are the default here.
+On BTC, the in-sample GARCH(1,1) fit gives persistence α + β = 0.968, a half-life of 21 sessions, and clean Ljung-Box and ARCH-LM tests on the squared standardized residuals. However, the robust standard error on α is 7× the classical one (0.196 against 0.028). With Gaussian errors, α looks highly significant; with robust errors, it does not. Most of the information comes from a few extreme days (−34% on 2020-03-12, Jarque-Bera ≈ 6300).
 
-### Variance risk premium
+### Is implied volatility too high?
 
 ![DVOL vs realized](docs/img/implied_vs_realized.png)
 
-The test compares DVOL observed at time t with realized volatility over the following 30 sessions. The windows overlap by 29 of 30 days, so a naive t-test is not usable (see below).
+The test compares DVOL observed at time t with realized volatility over the following 30 sessions. Consecutive observations share 29 of 30 days, so a naive t-test is not valid (see below).
 
 | | mean spread | 95% CI | Hansen-Hodrick p | 68 non-overlapping windows p | implied > realized |
 |---|---:|---:|---:|---:|---:|
 | BTC | +7.2 vol pts | [3.6, 10.8] | <0.001 | <0.001 | 73% of days |
 | ETH | +4.7 vol pts | [−0.5, 9.9] | 0.075 | 0.027 | 66% of days |
 
-- BTC implied volatility has systematically overpriced subsequent realized volatility since DVOL launched (2021).
-- On ETH the sign is the same, but the evidence is weaker and depends on the test.
+- BTC implied volatility has systematically exceeded subsequent realized volatility since DVOL launched (March 2021).
+- ETH shows the same sign, but the evidence is weaker and depends on the test used.
 - The Mincer-Zarnowitz slope of realized variance on implied variance is 0.59 for BTC and 0.66 for ETH: implied variance overreacts.
 
-### Earnings straddles
-
-![Earnings scan](docs/img/earnings_scan.png)
-
-The 17 large caps reporting in the two weeks after 2026-10-27 were screened. For each ticker, the red tick is the ATM straddle implied move to the first expiry after the announcement. The blue dot is the historical move over the same horizon (same number of sessions before the event, same holding length), rescaled to today's volatility.
-
-- Only **XOM** passes the 10% false discovery rate threshold (q = 0.039): the straddle prices a 3.3% move against 2.4% expected.
-- AMD has a raw p-value close to 0.05, but it does not survive the correction for 17 simultaneous tests.
-- Lesson: with about 60 announcements per name, single-stock earnings edges are usually too small to tell apart from noise. This screener is built to say so.
-
-### Sampling frequency
+### Which bar size for the live monitor?
 
 ![Signature plot](docs/img/signature.png)
 
-Realized volatility from trade prices falls as the sampling interval grows, from 34% at 1 minute to 28% at 2 hours. This is the signature of microstructure noise. The live monitor therefore uses the **mark price** (an index-based price that does not bounce between bid and ask). For trade-price bars, an interval of at least 5 minutes is preferable.
+Realized volatility from trade prices falls as the sampling interval grows, from about 34% at 1 minute to 28% at 2 hours. At very short intervals, the bid-ask bounce adds noise. The default of 1-minute bars stays in the flat part of the curve. Shorter bars are available but biased upward.
 
 ---
 
@@ -73,158 +62,121 @@ Realized volatility from trade prices falls as the sampling interval grows, from
 ```bash
 git clone https://github.com/Thibautdqb/volatility-engine.git
 cd volatility-engine
-pip install -e ".[earnings,dashboard]"   # core only: pip install -e .
+pip install -e ".[dashboard]"     # core only: pip install -e .
 ```
 
-Python 3.10 to 3.12. Data sources: Deribit public API (crypto) and Yahoo Finance via `yfinance` (equities, earnings calendar, option chains). No credentials are needed.
+Python 3.10 to 3.12.
 
 ## Usage
 
-### Command line
-
 ```bash
-# live monitor: BTC and ETH perpetuals, 1-minute bars, 2-hour window
-volengine live BTC-PERPETUAL ETH-PERPETUAL --bar 60 --window 120
-
-# full historical study (about 15 s: downloads hourly bars since 2019)
-volengine report BTC-PERPETUAL
-
-# earnings screener over a universe, announcements within 21 days
-volengine earnings scan AAPL MSFT AMZN GOOGL META NVDA AMD --horizon 21 --csv scan.csv
-
-# detail for one name, with every past announcement
-volengine earnings ticker NVDA --moves
+volengine live                       # BTC and ETH, 1-minute bars, 120-bar window
+volengine live BTC-PERPETUAL --bar 300 --window 96
+volengine report BTC-PERPETUAL       # full study, about 15 s
+streamlit run dashboard/app.py       # Live and Research views
 ```
 
+`volengine live` prints one row per instrument and refreshes on every completed bar:
+
 ```
-NVDA  earnings 2026-11-17 (AMC), spot 217.75
+annualized volatility, 60s bars, window 120 bars   19:52:01 UTC
 
-Option market (expiry 2026-11-20, 18 sessions)
-  ATM straddle 19.12 at K=217.75, bid-ask 0.8% of mid
-  implied move 8.78%, ATM vol 42.9%
-  term-structure split: event-only move 4.82%, ex-event vol 34.5% (approximate post-event IV)
-
-History (57 announcements)
-  mean |move| to expiry 11.15%  95% CI [8.74%, 13.72%]
-  median 8.78%; implied move sits at the 51% percentile
-  hit rate (|move| > implied) 49%  95% Wilson CI [37%, 62%]
-  announcement-day move = 3.18x a normal-day sigma on average
-
-Edge (expected straddle payoff at expiry minus premium, % of spot, before costs)
-  raw            2.37%  p 0.073
-  vol-adjusted   0.34%  95% CI [-1.81%, 2.69%]  p 0.774
+                   price   ewma     cc       cc 95% ci parkinson garman-klass yang-zhang   dvol  bars  lambda
+BTC-PERPETUAL  80,652.50  21.1%  19.8%  [17.6%, 22.7%]     18.0%        17.3%      17.9%  37.3%   120  0.9546
+ETH-PERPETUAL   2,344.85  32.5%  33.2%  [29.5%, 38.0%]     19.9%        14.9%      19.7%  53.1%   120  0.9426
 ```
 
-The NVDA example shows why the vol adjustment matters. On raw numbers, past moves (11.2%) look larger than the implied move (8.8%). Once each move is rescaled by the volatility regime of its period, the edge disappears.
-
-### Dashboard
-
-```bash
-streamlit run dashboard/app.py
-```
-
-Three views:
-- **Live**: streaming estimators and the EWMA path.
-- **Research**: the report above, with charts.
-- **Earnings**: the screener.
-
-### Library
+As a library:
 
 ```python
+from volengine.research import load_daily
 from volengine.garch import fit_garch
 from volengine.evaluation import walk_forward_forecasts, compare_forecasts
-from volengine.research import load_daily
 
 data = load_daily("ETH-PERPETUAL")
 fit = fit_garch(data.returns)
 print(fit.summary(), fit.diagnostics)
-
-forecasts = walk_forward_forecasts(data.returns, train=750, refit_every=21)
-print(compare_forecasts(forecasts, data.realized_variance))
+print(compare_forecasts(walk_forward_forecasts(data.returns), data.realized_variance))
 ```
 
 ---
 
-## Methodology
+## How it works
+
+### Live monitor
+
+1. **Seeding.** On start, the monitor downloads the last 2,000 completed one-minute trade bars from the REST API. They warm up the estimators, and the EWMA decay λ is fitted on them.
+2. **Live bars.** It then subscribes to `trades.{instrument}.100ms` and `deribit_volatility_index.{index}`. Live bars come from the same trade prints as the historical candles, so seeded and live bars form one continuous series, without duplicates or a break in definition.
+3. **Disconnections.** The heartbeat and exponential-backoff reconnection are handled. After a reconnection, the monitor re-seeds from REST so that the gap is filled with real bars, not flat ones.
 
 ### Estimators
 
-Variances are per bar and annualized with 365 days for crypto (continuous trading), 252 for equities.
+Variances are per bar and annualized over 365 days (crypto trades continuously).
 
-| estimator | formula (per bar) | note |
+| estimator | per-bar variance | note |
 |---|---|---|
-| close-to-close | r² (zero mean) | the drift is negligible next to its estimation error |
+| close-to-close | r² (zero mean) | χ² 95% interval in the live view |
 | Parkinson | (ln H/L)² / 4 ln 2 | ~5× more efficient under GBM |
 | Garman-Klass | ½(ln H/L)² − (2 ln 2 − 1)(ln C/O)² | ~7× |
 | Rogers-Satchell | ln(H/C) ln(H/O) + ln(L/C) ln(L/O) | robust to drift |
-| Yang-Zhang | σ²_overnight + k σ²_open-close + (1−k) σ²_RS | robust to drift and opening jumps |
-| EWMA | σ²_t = λ σ²_{t−1} + (1−λ) r²_{t−1} | λ fitted by minimizing QLIKE, not fixed at 0.94 |
-
-The live monitor is seeded with **real** historical bars. The original prototype interpolated one-minute prices onto a finer grid, which creates near-zero returns and pulls the estimate down. It also needed credentials for the `.raw` ticker channel; the public `100ms` channel is enough.
+| Yang-Zhang | σ²_open + k σ²_open-close + (1−k) σ²_RS | robust to drift and jumps |
+| EWMA | σ²_t = λ σ²_{t−1} + (1−λ) r²_{t−1} | λ fitted by minimizing QLIKE |
 
 ### GARCH(1,1)
 
-- **Estimation**: Gaussian quasi-maximum likelihood, on returns rescaled to unit variance for numerical conditioning.
-- **Variance recursion**: computed as an IIR filter (`scipy.signal.lfilter`), so a fit on 3,000 observations takes about 50 ms.
-- **Standard errors**: Bollerslev-Wooldridge sandwich.
-- **Validation**: the test suite checks parameters, standard errors and log-likelihood against the `arch` package.
-- **Diagnostics**: Ljung-Box on z², ARCH-LM on z, Jarque-Bera.
+- **Estimation**: Gaussian quasi-maximum likelihood, on returns rescaled to unit variance.
+- **Variance recursion**: computed as an IIR filter (`scipy.signal.lfilter`), about 50 ms for 3,000 observations.
+- **Standard errors**: Bollerslev-Wooldridge robust (sandwich).
+- **Validation**: parameters, standard errors and log-likelihood are tested against the `arch` package.
 
-### Earnings
+### Daily data
 
-- **Straddle implied move**: (call + put)/S at the ATM strike, linearly interpolated between the two strikes around spot. This is the market's expected |S_T − S_0|/S_0 to expiry.
-- **Event-only move**: with two post-event expiries, total variance decomposes as w_i = σ_d² n_i + e² (n_i trading days of diffusion, one event jump of variance e²). This identifies e, and E|move| = e √(2/π). Inconsistent term structures return NaN instead of a forced number.
-- **Historical comparison, horizon-matched**: the window starts the same number of sessions before the announcement as today, and lasts until the same number of sessions as the listed expiry. BMO/AMC timing comes from the announcement time. When Yahoo has no time for the next date, the timing is inferred from the company's history if at least 80% of it is consistent.
-- **Vol adjustment**: each historical move is divided by the 21-day realized volatility just before its window, then multiplied by today's.
+- **Sessions**: built from hourly bars on the 08:00 UTC boundary. A session's return is the sum of its hourly log returns, so it covers exactly the same window as its realized variance. Incomplete sessions are dropped.
+- **DVOL alignment**: the close of each UTC day is assigned to the session that opens 8 hours later, so implied volatility is always known before the window it is compared with. There is no look-ahead.
 
 ## Statistical design
 
-| question | test | why this one |
+| question | test | why |
 |---|---|---|
-| Is there volatility clustering? | ARCH-LM (Engle, 1982) | justifies conditional models at all |
+| Is there volatility clustering? | ARCH-LM (Engle, 1982) | justifies conditional models |
 | Is the GARCH fit adequate? | Ljung-Box on z², ARCH-LM on z | remaining ARCH effects |
 | Are parameters significant? | sandwich standard errors | returns are far from Gaussian |
-| Does model A forecast better than B? | Diebold-Mariano, HAC variance, HLN small-sample correction, Student-t | loss differentials are autocorrelated |
-| Is a forecast unbiased? | Mincer-Zarnowitz, Wald a = 0, b = 1, HAC covariance | |
-| Loss function | QLIKE | ranking stays consistent with a noisy variance proxy (Patton, 2011) |
+| Does model A forecast better than B? | Diebold-Mariano, HAC variance, Harvey-Leybourne-Newbold correction | loss differentials are autocorrelated |
+| Is a forecast unbiased? | Mincer-Zarnowitz, Wald a = 0, b = 1, HAC | |
+| Loss function | QLIKE | robust to the noise in the realized-variance proxy |
 | Implied minus realized, overlapping windows | Hansen-Hodrick, t(n/h − 1), plus non-overlapping windows as a robustness check | Newey-West rejects ~12% of the time at a nominal 5% here; Hansen-Hodrick 5.4% (simulated, n = 900, h = 30) |
-| Interval on realized vol | stationary block bootstrap | the χ² interval assumes iid Gaussian returns |
-| Earnings hit rate | Wilson interval | small n |
-| Many tickers at once | Benjamini-Hochberg FDR | at 5%, 1 in 20 null tickers would otherwise pass |
+| Interval on realized volatility | stationary block bootstrap (report), χ² (live) | the bootstrap does not assume iid Gaussian returns |
 
-The test suite checks the **size** of the DM, Hansen-Hodrick and VRP tests under the null, as well as the **coverage** of the χ² and bootstrap intervals. The HAC, Ljung-Box, ARCH-LM, Wilson and Benjamini-Hochberg implementations are compared with statsmodels.
+The test suite checks the size of the Diebold-Mariano, Hansen-Hodrick and variance-risk-premium tests under the null, and the coverage of the χ² and bootstrap intervals. The HAC, Ljung-Box, ARCH-LM and OLS implementations are compared with statsmodels.
 
 ## Limitations
 
-- **No historical option prices.** They are not freely available, so the earnings study compares *today's* implied move with past realized moves. It does not backtest straddle P&L, and it cannot tell whether implied moves have historically been rich or cheap for a given name.
-- The modelled payoff is the payoff at expiry, before bid-ask, commissions and early exit. Quotes taken outside US market hours are flagged as stale.
-- yfinance scrapes Yahoo Finance. It has no SLA and its earnings times are sometimes missing.
-- Trading days use the US federal holiday calendar as an approximation of the NYSE calendar (Good Friday is missing).
-- Vol adjustment uses the current 21-day realized volatility as if it were known exactly. Its own estimation error is not propagated into the edge's interval.
-- Hourly realized variance is a proxy. Finer sampling would reduce its noise but adds microstructure bias (see the signature plot).
+- **Realized-variance proxy.** Hourly realized variance is noisy. Finer sampling would reduce the noise but adds microstructure bias.
+- **Live χ² interval.** It assumes iid Gaussian returns, which makes it too narrow when volatility clusters. It is computed live because it is cheap. The report uses the block bootstrap instead.
+- **Thin bars.** On ETH at 1 minute, close-to-close and range estimators diverge (33% against 20% in the example above). With fewer trades per bar, the observed range understates the true range, and closes bounce between bid and ask. For ETH, prefer 5-minute bars (`--bar 300`).
+- **Scope.** Only Deribit perpetuals and DVOL (BTC and ETH) are covered.
 
 ## Project layout
 
 ```
 src/volengine/
-  estimators.py     realized vol estimators, EWMA, confidence intervals, cone, signature plot
-  garch.py          GARCH(1,1) QMLE, robust standard errors, forecasts, diagnostics
-  stats.py          HAC, Diebold-Mariano, Mincer-Zarnowitz, Ljung-Box, ARCH-LM, bootstrap, BH
-  evaluation.py     walk-forward forecasts and loss comparison
-  research.py       end-to-end historical study on a Deribit instrument
-  live.py           bar aggregation, streaming EWMA, live monitor
-  deribit/          REST client (paginated) and WebSocket stream (heartbeat, reconnect)
-  earnings/         calendar and chains, implied move, historical moves, screener
+  estimators.py   realized volatility estimators, EWMA, confidence intervals, cone, signature plot
+  garch.py        GARCH(1,1) QMLE, robust standard errors, forecasts, diagnostics
+  stats.py        HAC, Hansen-Hodrick, Diebold-Mariano, Mincer-Zarnowitz, Ljung-Box, ARCH-LM, bootstrap
+  evaluation.py   walk-forward forecasts and loss comparison
+  research.py     daily sessions, variance risk premium, full report
+  live.py         bar aggregation, streaming EWMA, live monitor
+  deribit/        REST client (paginated) and WebSocket stream (heartbeat, reconnect)
   cli.py
-dashboard/app.py    Streamlit front-end
-scripts/            figure generation
-tests/              offline unit tests + `pytest -m network` integration tests
+dashboard/app.py  Streamlit front-end
+scripts/          figure generation
+tests/            unit tests + integration tests against Deribit (pytest -m network)
 ```
 
 ```bash
 pip install -e ".[dev]"
-pytest -m "not network"     # offline, ~10 s
-pytest -m network           # hits Deribit
+pytest -m "not network"
+pytest -m network
 ruff check . && ruff format --check .
 ```
 
@@ -237,8 +189,6 @@ ruff check . && ruff format --check .
 - Hansen & Lunde (2005). A forecast comparison of volatility models: does anything beat a GARCH(1,1)? *JAE*.
 - Patton (2011). Volatility forecast comparison using imperfect volatility proxies. *J. Econometrics*.
 - Yang & Zhang (2000). Drift-independent volatility estimation based on high, low, open, and close prices. *J. Business*.
-- Dubinsky, Johannes, Kaeck & Seeger (2019). Option pricing of earnings announcement risks. *RFS*.
-- Benjamini & Hochberg (1995). Controlling the false discovery rate. *JRSS B*.
 
 ## License
 

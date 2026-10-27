@@ -5,7 +5,7 @@ import asyncio
 import pandas as pd
 import pytest
 
-from volengine.deribit import DeribitREST, DeribitStream, Tick
+from volengine.deribit import DeribitREST, DeribitStream, Trade
 
 pytestmark = pytest.mark.network
 
@@ -27,13 +27,13 @@ def test_rest_dvol():
     assert df["close"].between(5, 300).all()
 
 
-async def test_stream_delivers_ticks():
+async def test_stream_delivers_trades():
     stream = DeribitStream(["BTC-PERPETUAL"], ["btc_usd"])
 
-    async def first_tick():
+    async def first_trade():
         async for ev in stream.events():
-            if isinstance(ev, Tick):
+            if isinstance(ev, Trade):
                 return ev
 
-    tick = await asyncio.wait_for(first_tick(), timeout=20)
-    assert tick.instrument == "BTC-PERPETUAL" and tick.mark_price > 0
+    trade = await asyncio.wait_for(first_trade(), timeout=20)
+    assert trade.instrument == "BTC-PERPETUAL" and trade.price > 0

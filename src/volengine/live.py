@@ -1,10 +1,14 @@
 """Streaming volatility monitor.
 
-Ticks are aggregated into fixed-length bars aligned on the epoch. Each completed bar
-updates an O(1) EWMA variance and a rolling window of OHLC bars used for the
-range-based estimators. The monitor is seeded with real historical bars from the
-REST API, never with interpolated prices: interpolation invents zero-variance
-returns and biases the volatility estimate downward.
+Trades are aggregated into fixed-length bars aligned on the epoch. Each completed
+bar updates an O(1) EWMA variance and a rolling window of OHLC bars used for the
+range-based estimators.
+
+Live bars and the historical bars used to seed the monitor share one definition
+(trade-price OHLC from the same exchange), so the series is continuous. Seeding
+uses completed historical bars only, never interpolated prices: interpolation
+invents zero-variance returns and biases the estimate downward. After a dropped
+connection the monitor re-seeds from REST, so the gap is filled with real bars.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from scipy import stats
 
 from volengine import estimators as est
 from volengine.deribit.rest import RESOLUTIONS, DeribitREST
-from volengine.deribit.stream import DeribitStream, DvolUpdate, Event, Tick
+from volengine.deribit.stream import DeribitStream, DvolUpdate, Event, Reconnected, Trade
 
 log = logging.getLogger(__name__)
 
@@ -40,16 +44,23 @@ class Bar:
 
 
 class BarAggregator:
-    """Build epoch-aligned OHLC bars from a tick stream."""
+    """Build epoch-aligned OHLC bars from a trade stream.
 
-    def __init__(self, bar_seconds: float):
+    ``after`` is the start time of the last bar already known (e.g. from history):
+    trades belonging to that bar or earlier are ignored.
+    """
+
+    def __init__(self, bar_seconds: float, after: float | None = None):
         self.bar_seconds = bar_seconds
+        self._min_bucket = None if after is None else int(after // bar_seconds) + 1
         self._bucket: int | None = None
         self._bar: Bar | None = None
 
     def update(self, timestamp: float, price: float) -> list[Bar]:
         bucket = int(timestamp // self.bar_seconds)
         done: list[Bar] = []
+        if self._min_bucket is not None and bucket < self._min_bucket:
+            return done
         if self._bar is None:
             self._bucket = bucket
             self._bar = Bar(bucket * self.bar_seconds, price, price, price, price)
@@ -59,7 +70,7 @@ class BarAggregator:
         if bucket > self._bucket:
             done.append(self._bar)
             last = self._bar.close
-            # Buckets without ticks: price did not move, emit flat bars to keep the grid regular.
+            # Buckets without trades: the price did not move, emit flat bars to keep a regular grid.
             for b in range(self._bucket + 1, bucket):
                 done.append(Bar(b * self.bar_seconds, last, last, last, last))
             self._bucket = bucket
@@ -155,17 +166,23 @@ class LiveVolMonitor:
     # -- seeding ------------------------------------------------------------
 
     def seed(self, rest: DeribitREST, lookback_bars: int = 2000) -> None:
-        """Warm up every instrument from historical trade bars."""
+        """(Re)initialize every instrument from completed historical trade bars."""
         native = {v: k for k, v in RESOLUTIONS.items()}
-        for instrument, st in self._state.items():
+        for instrument in self._state:
             res = native.get(int(self.bar_seconds), "1")
             res_seconds = RESOLUTIONS[res]
             end = pd.Timestamp.now(tz="UTC")
             start = end - pd.Timedelta(seconds=res_seconds * lookback_bars)
             hist = rest.ohlc(instrument, res, start, end)
+            # Drop the bar still in progress: it would be duplicated by the live stream.
+            hist = hist[hist.index + pd.Timedelta(seconds=res_seconds) <= end]
             if len(hist) < 50:
                 log.warning("not enough history to seed %s", instrument)
                 continue
+            with self._lock:
+                old = self._state[instrument]
+                st = _InstrumentState(self.bar_seconds, self.window, old.ewma.lam)
+                st.aggregator = BarAggregator(self.bar_seconds, after=hist.index[-1].timestamp())
             r = est.log_returns(hist["close"])
             # Variance scales linearly with horizon under a random walk.
             scale = self.bar_seconds / res_seconds
@@ -180,6 +197,9 @@ class LiveVolMonitor:
                 for ts, row in hist.tail(self.window).iterrows():
                     st.bars.append(Bar(ts.timestamp(), row.open, row.high, row.low, row.close))
             st.last_price = float(hist["close"].iloc[-1])
+            st.last_time = hist.index[-1].timestamp() + res_seconds
+            with self._lock:
+                self._state[instrument] = st
             log.info("seeded %s with %d bars, lambda=%.4f", instrument, len(hist), st.ewma.lam)
 
     # -- event handling -----------------------------------------------------
@@ -190,11 +210,11 @@ class LiveVolMonitor:
             if isinstance(event, DvolUpdate):
                 self._dvol[event.index_name] = event.value / 100.0
                 return False
-            if not isinstance(event, Tick) or event.instrument not in self._state:
+            if not isinstance(event, Trade) or event.instrument not in self._state:
                 return False
             st = self._state[event.instrument]
-            st.last_price, st.last_time = event.mark_price, event.timestamp
-            completed = st.aggregator.update(event.timestamp, event.mark_price)
+            st.last_price, st.last_time = event.price, event.timestamp
+            completed = st.aggregator.update(event.timestamp, event.price)
             for bar in completed:
                 prev = st.bars[-1].close if st.bars else None
                 if prev is not None and prev > 0:
@@ -264,9 +284,16 @@ class LiveVolMonitor:
 
     # -- runners -----------------------------------------------------------
 
-    async def run(self, stream: DeribitStream | None = None, on_bar=None) -> None:
+    async def run(
+        self, stream: DeribitStream | None = None, on_bar=None, rest: DeribitREST | None = None
+    ) -> None:
         stream = stream or DeribitStream(self.instruments, self.dvol_indices)
         async for event in stream.events():
+            if isinstance(event, Reconnected):
+                log.info("reconnected, backfilling the gap from REST")
+                api = rest or DeribitREST()
+                await asyncio.to_thread(self.seed, api)
+                continue
             if self.on_event(event) and on_bar is not None:
                 on_bar(self)
 

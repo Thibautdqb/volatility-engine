@@ -2,11 +2,13 @@
 
 Only public channels are used, so no API key is required:
 
-* ``ticker.{instrument}.100ms``: mark price, index price, best bid/ask
-* ``deribit_volatility_index.{index}``: DVOL, the 30-day implied volatility index
+* ``trades.{instrument}.100ms``: every trade print. Bars built from it have the
+  same definition as the REST candles used for seeding (trade OHLC).
+* ``deribit_volatility_index.{index}``: DVOL, the 30-day implied volatility index.
 
 The connection is kept alive with Deribit's heartbeat mechanism and re-established
-with exponential backoff on any failure.
+with exponential backoff on any failure. After a reconnection a :class:`Reconnected`
+event is emitted so that consumers can backfill the gap.
 """
 
 from __future__ import annotations
@@ -25,13 +27,11 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class Tick:
+class Trade:
     instrument: str
     timestamp: float  # seconds since epoch, exchange time
-    mark_price: float
-    index_price: float
-    best_bid: float | None
-    best_ask: float | None
+    price: float
+    amount: float
 
 
 @dataclass(frozen=True)
@@ -41,32 +41,40 @@ class DvolUpdate:
     value: float  # annualized vol in percent
 
 
-Event = Tick | DvolUpdate
+@dataclass(frozen=True)
+class Reconnected:
+    pass
 
 
-def parse_message(message: dict) -> Event | None:
-    """Turn a raw subscription notification into a typed event (None otherwise)."""
+Event = Trade | DvolUpdate | Reconnected
+
+
+def parse_message(message: dict) -> list[Event]:
+    """Turn a raw subscription notification into typed events."""
     if message.get("method") != "subscription":
-        return None
+        return []
     params = message.get("params", {})
     channel: str = params.get("channel", "")
-    data = params.get("data", {})
-    if channel.startswith("ticker."):
-        return Tick(
-            instrument=data["instrument_name"],
-            timestamp=data["timestamp"] / 1000.0,
-            mark_price=float(data["mark_price"]),
-            index_price=float(data["index_price"]),
-            best_bid=data.get("best_bid_price"),
-            best_ask=data.get("best_ask_price"),
-        )
+    data = params.get("data")
+    if channel.startswith("trades."):
+        return [
+            Trade(
+                instrument=t["instrument_name"],
+                timestamp=t["timestamp"] / 1000.0,
+                price=float(t["price"]),
+                amount=float(t["amount"]),
+            )
+            for t in data
+        ]
     if channel.startswith("deribit_volatility_index."):
-        return DvolUpdate(
-            index_name=data["index_name"],
-            timestamp=data["timestamp"] / 1000.0,
-            value=float(data["volatility"]),
-        )
-    return None
+        return [
+            DvolUpdate(
+                index_name=data["index_name"],
+                timestamp=data["timestamp"] / 1000.0,
+                value=float(data["volatility"]),
+            )
+        ]
+    return []
 
 
 class DeribitStream:
@@ -78,7 +86,7 @@ class DeribitStream:
         heartbeat: int = 30,
         max_backoff: float = 60.0,
     ):
-        self.channels = [f"ticker.{i}.100ms" for i in instruments] + [
+        self.channels = [f"trades.{i}.100ms" for i in instruments] + [
             f"deribit_volatility_index.{i}" for i in dvol_indices
         ]
         self.url = url
@@ -93,6 +101,7 @@ class DeribitStream:
 
     async def events(self) -> AsyncIterator[Event]:
         attempt = 0
+        connected_before = False
         while True:
             try:
                 async with websockets.connect(self.url, open_timeout=10, ping_interval=None) as ws:
@@ -100,6 +109,9 @@ class DeribitStream:
                     await ws.send(self._request("public/subscribe", channels=self.channels))
                     log.info("subscribed to %s", self.channels)
                     attempt = 0
+                    if connected_before:
+                        yield Reconnected()
+                    connected_before = True
                     async for raw in ws:
                         msg = json.loads(raw)
                         if "error" in msg:
@@ -109,8 +121,7 @@ class DeribitStream:
                             if msg["params"].get("type") == "test_request":
                                 await ws.send(self._request("public/test"))
                             continue
-                        event = parse_message(msg)
-                        if event is not None:
+                        for event in parse_message(msg):
                             yield event
             except asyncio.CancelledError:
                 raise
