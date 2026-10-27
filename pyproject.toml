@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "volengine"
 version = "0.1.0"
-description = "Realized and implied volatility toolkit: streaming estimators on Deribit, GARCH forecasting with out-of-sample evaluation, and an earnings implied-move screener."
+description = "Crypto volatility on Deribit: streaming realized-volatility estimators, GARCH forecast evaluation and the implied-realized variance risk premium."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Thibautdqb" }]
-keywords = ["volatility", "garch", "ewma", "deribit", "options", "earnings", "quantitative-finance"]
+keywords = ["volatility", "garch", "ewma", "deribit", "options", "quantitative-finance"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -26,8 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-earnings = ["yfinance>=0.2.50"]
-dashboard = ["streamlit>=1.46", "plotly>=5.20", "yfinance>=0.2.50"]
+dashboard = ["streamlit>=1.46", "plotly>=5.20"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -35,7 +34,6 @@ dev = [
     "arch>=7.0",
     "statsmodels>=0.14",
     "matplotlib>=3.8",
-    "yfinance>=0.2.50",
 ]
 
 [project.scripts]

@@ -1,11 +1,10 @@
 """Regenerate the figures in docs/img from live data.
 
-python scripts/make_figures.py [--earnings AAPL MSFT ...]
+python scripts/make_figures.py
 """
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -66,50 +65,7 @@ def signature(instrument: str = "BTC-PERPETUAL", days: int = 14) -> None:
     fig.savefig(OUT / "signature.png")
 
 
-def earnings(tickers: list[str]) -> None:
-    from volengine.earnings.screener import scan
-
-    df = scan(tickers, horizon_days=21)
-    if df.empty:
-        print("no upcoming announcements in the universe, skipping earnings figure")
-        return
-    df = df.sort_values("implied_move")
-    y = np.arange(len(df))
-    fig, ax = plt.subplots(figsize=(7, 0.35 * len(df) + 1.2))
-    ax.errorbar(
-        df["predicted_move"],
-        y,
-        xerr=[df["adj_edge"] - df["adj_edge_lo"], df["adj_edge_hi"] - df["adj_edge"]],
-        fmt="o",
-        ms=4,
-        capsize=2,
-        label="vol-adjusted historical |move| (95% CI)",
-    )
-    ax.scatter(df["implied_move"], y, marker="|", s=120, color="C3", label="straddle implied move")
-    for yi, (_, row) in zip(y, df.iterrows(), strict=True):
-        if row["significant"]:
-            ax.annotate(
-                f"q={row['q_value']:.3f}",
-                (row["implied_move"], yi),
-                xytext=(6, -3),
-                textcoords="offset points",
-                fontsize=7,
-                color="C3",
-            )
-    ax.set_yticks(y, labels=[f"{t}  {e}" for t, e in zip(df["ticker"], df["event"], strict=True)])
-    ax.xaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
-    ax.set_title(f"Expected absolute move to expiry, as of {pd.Timestamp.now():%Y-%m-%d}")
-    ax.legend(loc="lower right", fontsize=7)
-    fig.tight_layout()
-    fig.savefig(OUT / "earnings_scan.png")
-
-
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--earnings", nargs="*", default=[])
-    args = p.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     implied_vs_realized()
     signature()
-    if args.earnings:
-        earnings(args.earnings)
