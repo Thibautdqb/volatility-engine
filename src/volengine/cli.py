@@ -247,7 +247,9 @@ def cmd_earnings_ticker(args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="volengine", description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(
+        prog="volengine", description="Realized and implied volatility toolkit."
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
 
