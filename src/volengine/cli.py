@@ -26,6 +26,10 @@ def _pct(x: float | None, digits: int = 1, sign: bool = False) -> str:
     return f"{100 * x:{'+' if sign else ''}.{digits}f}%"
 
 
+def _bp(x: float | None) -> str:
+    return "n/a" if x is None or pd.isna(x) else f"{1e4 * x:+.1f}bp"
+
+
 def _duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds < 3600:
@@ -86,7 +90,7 @@ def cmd_live(args) -> None:
                     "ratio": f"{s.ratio:.2f}x",
                     "vol 1m": _pct(s.fast_vol),
                     "normal": _pct(s.slow_vol),
-                    "move 1m": _pct(s.move_1m, 2, sign=True),
+                    "move 1m": _bp(s.move_1m),
                     "1sd 1m": _price(s.sigma_1m),
                     "trades": f"{s.activity:.1f}x",
                     "dvol": _pct(s.dvol),
@@ -109,10 +113,10 @@ def cmd_live(args) -> None:
                 out.append(
                     paint(
                         f"{a.time:%H:%M:%S}  {a.instrument:<14} "
-                        f"{a.previous.name.lower():>8} -> {a.level.name.lower():<8} "
+                        f"{a.previous.name.lower():>8} -> {a.level.name.lower():<8}  "
                         f"ratio {a.ratio:4.2f}x  vol 1m {_pct(a.fast_vol):>6}  "
-                        f"normal {_pct(a.slow_vol):>6}  move 1m {_pct(a.move_1m, 2, True):>7}  "
-                        f"@ {_price(a.price)}",
+                        f"normal {_pct(a.slow_vol):>6}  move 1m {_bp(a.move_1m):>7}  "
+                        f"@ {_price(a.price)}" + ("" if a.live else "  (history)"),
                         a.level,
                     )
                 )

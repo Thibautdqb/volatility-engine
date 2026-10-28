@@ -164,3 +164,16 @@ async def test_run_buffers_during_seed_and_reseeds_after_reconnect():
     hist = m.history(INSTRUMENT)
     assert hist.index.is_unique
     assert hist.index[-1] >= pd.Timestamp(int(live[-1].timestamp_ms) - 20_000, unit="ms", tz="UTC")
+
+
+def test_alerts_found_in_startup_history_are_listed_but_not_sent():
+    vol = np.r_[np.full(3 * 3600, 0.4), np.full(300, 2.0), np.full(1200, 0.4)]
+    trades = simulate_trades(vol.size, vol, rate=2.0, seed=5)
+    received = []
+    m = LiveSpikeMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
+    m.apply_seed({INSTRUMENT: trades})
+    alerts = m.alerts()
+    assert alerts and not received
+    assert all(not a.live and a.dvol is None for a in alerts)
+    m.apply_seed({INSTRUMENT: trades})  # re-seeding after a reconnection does not duplicate
+    assert m.alerts() == alerts

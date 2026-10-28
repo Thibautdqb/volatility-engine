@@ -20,6 +20,19 @@ LEVEL_COLOR = {Level.NORMAL: "#2e7d32", Level.ELEVATED: "#ef6c00", Level.SPIKE: 
 LEVEL_FILL = {Level.ELEVATED: "rgba(239,108,0,0.12)", Level.SPIKE: "rgba(198,40,40,0.18)"}
 
 
+def duration(td: pd.Timedelta) -> str:
+    s = max(0, int(td.total_seconds()))
+    return f"{s // 60}m {s % 60:02d}s" if s < 3600 else f"{s // 3600}h {s % 3600 // 60:02d}m"
+
+
+def price(x: float) -> str:
+    return f"{x:,.1f}" if x >= 1000 else f"{x:,.2f}"
+
+
+def bp(x) -> str:
+    return "n/a" if x is None or pd.isna(x) else f"{1e4 * x:+.1f} bp"
+
+
 def pct(x, d=1, sign=False):
     return "n/a" if x is None or pd.isna(x) else f"{100 * x:{'+' if sign else ''}.{d}f}%"
 
@@ -75,6 +88,13 @@ with st.sidebar:
     reset = st.number_input("Reset below ratio", 1.0, 5.0, d.reset, 0.1)
     hours = st.slider("Chart window (h)", 0.5, 6.0, 2.0, 0.5)
 
+st.title("Volatility spike monitor")
+st.caption(
+    f"Deribit perpetuals, {bar:g}-second bars. **Ratio** = volatility over the last minute "
+    "(EWMA, half-life 1 min) / normal volatility (EWMA, half-life 30 min). "
+    f"ELEVATED at {elevated:g}x, SPIKE at {spike:g}x, back to NORMAL below {reset:g}x."
+)
+
 if not instruments:
     st.info("Select at least one instrument.")
     st.stop()
@@ -98,20 +118,21 @@ def render() -> None:
             st.caption(f"{inst}: warming up")
             continue
         badge = LEVEL_COLOR[s.level]
-        held = s.time - s.level_since
         st.markdown(
             f"### {inst} &nbsp; <span style='background:{badge};color:white;padding:2px 10px;"
             f"border-radius:4px;font-size:0.8em'>{s.level.name}</span> "
-            f"<span style='font-size:0.7em;color:gray'>for {str(held).split('.')[0]} "
+            f"<span style='font-size:0.7em;color:gray'>for {duration(s.time - s.level_since)} "
             f"· {s.time:%H:%M:%S} UTC</span>",
             unsafe_allow_html=True,
         )
         c = st.columns(7)
-        c[0].metric("Price", f"{s.price:,.2f}", pct(s.move_1m, 2, sign=True), help="move over 1m")
+        c[0].metric("Price", price(s.price), bp(s.move_1m), help="change over the last minute")
         c[1].metric("Vol ratio", f"{s.ratio:.2f}x", help="vol over the last minute / normal")
         c[2].metric("Vol 1m", pct(s.fast_vol), help="EWMA, half-life 1 minute, annualized")
         c[3].metric("Normal vol", pct(s.slow_vol), help="EWMA, half-life 30 minutes")
-        c[4].metric("1 sd move / 1m", f"{s.sigma_1m:,.2f}", help="at the current 1m vol")
+        c[4].metric(
+            "1 sd move / 1m", f"±{price(s.sigma_1m)}", help="one standard deviation, at vol 1m"
+        )
         c[5].metric("Trade rate", f"{s.activity:.1f}x", help="trades per bar vs normal")
         c[6].metric("DVOL", pct(s.dvol), help="Deribit 30-day implied vol index")
         h = monitor.history(inst)
@@ -123,12 +144,20 @@ def render() -> None:
     if not alerts:
         st.caption("No alert since start.")
         return
+    st.caption("history = found in the trades loaded at start-up, before the live feed")
     table = pd.DataFrame([a.as_dict() for a in reversed(alerts)])
+    table["source"] = table.pop("live").map({True: "live", False: "history"})
+    table["level"] = table["previous"] + " → " + table["level"]
+    table = table.drop(columns="previous")
     table["time"] = pd.to_datetime(table["time"]).dt.strftime("%H:%M:%S")
     for col in ("fast_vol", "slow_vol", "dvol"):
         table[col] = table[col].map(pct)
-    table["move_1m"] = table["move_1m"].map(lambda x: pct(x, 2, sign=True))
+    table["move_1m"] = table["move_1m"].map(bp)
     table["ratio"] = table["ratio"].map("{:.2f}x".format)
+    table["price"] = table["price"].map(price)
+    table = table.rename(
+        columns={"fast_vol": "vol 1m", "slow_vol": "normal vol", "move_1m": "move 1m"}
+    )
     st.dataframe(table, hide_index=True, width="stretch")
 
 

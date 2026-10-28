@@ -67,6 +67,7 @@ class Alert:
     price: float
     move_1m: float
     dvol: float | None
+    live: bool = True  # False when found while replaying the start-up history
 
     def as_dict(self) -> dict:
         d = {k: round(v, 6) if isinstance(v, float) else v for k, v in asdict(self).items()}
@@ -175,7 +176,11 @@ class LiveSpikeMonitor:
         return {i: rest.trades(i, end - self.seed_span, end) for i in self._state}
 
     def apply_seed(self, trades: dict[str, pd.DataFrame]) -> None:
-        """Rebuild every instrument's state from a trade history, without raising alerts."""
+        """Rebuild every instrument's state from a trade history.
+
+        Escalations found in the history are recorded with ``live=False`` so that the alert
+        list matches the charts, but ``on_alert`` is not called for them.
+        """
         for instrument, df in trades.items():
             st = _InstrumentState(self.config)
             if len(df):
@@ -186,14 +191,22 @@ class LiveSpikeMonitor:
                 epoch = pd.Timestamp(0, tz="UTC")
                 starts = ((closes.index - epoch) // pd.Timedelta(milliseconds=1)).to_numpy()
                 # Completed bars go through the detector; the last one is still in progress.
+                replayed = []
                 for t, c in zip(starts[:-1], closes.to_numpy()[:-1], strict=True):
-                    st.add_bar(int(t), float(c), int(counts.get(t // step, 0)))
+                    change = st.add_bar(int(t), float(c), int(counts.get(t // step, 0)))
+                    if change is not None:
+                        replayed.append(self._make_alert(instrument, st, change, live=False))
                 last = int(starts[-1] // step)
                 st.sampler = GridSampler(self.config.bar_seconds, last, float(closes.iloc[-1]))
                 st.sampler.trades = int(counts.get(last, 0))
                 st.seed_end = (int(df["timestamp"].iloc[-1]), set(df["trade_id"].iloc[-200:]))
             with self._lock:
                 self._state[instrument] = st
+                if len(df):
+                    known = {(a.instrument, a.time) for a in self._alerts}
+                    fresh = [a for a in replayed if (a.instrument, a.time) not in known]
+                    merged = sorted([*self._alerts, *fresh], key=lambda a: a.time)
+                    self._alerts = deque(merged, maxlen=self._alerts.maxlen)
             log.info("seeded %s with %d trades", instrument, len(df))
 
     # -- event handling -----------------------------------------------------
@@ -228,22 +241,26 @@ class LiveSpikeMonitor:
         for start_ms, close, n in bars:
             change = st.add_bar(start_ms, close, n)
             if change is not None:
-                snap = self._snapshot(instrument, st)
-                alert = Alert(
-                    time=snap.time,
-                    instrument=instrument,
-                    level=change[1],
-                    previous=change[0],
-                    ratio=snap.ratio,
-                    fast_vol=snap.fast_vol,
-                    slow_vol=snap.slow_vol,
-                    price=snap.price,
-                    move_1m=snap.move_1m,
-                    dvol=snap.dvol,
-                )
+                alert = self._make_alert(instrument, st, change)
                 self._alerts.append(alert)
                 out.append(alert)
         return out
+
+    def _make_alert(self, instrument: str, st: _InstrumentState, change, live=True) -> Alert:
+        snap = self._snapshot(instrument, st)
+        return Alert(
+            time=snap.time,
+            instrument=instrument,
+            level=change[1],
+            previous=change[0],
+            ratio=snap.ratio,
+            fast_vol=snap.fast_vol,
+            slow_vol=snap.slow_vol,
+            price=snap.price,
+            move_1m=snap.move_1m,
+            dvol=snap.dvol if live else None,
+            live=live,
+        )
 
     # -- output ------------------------------------------------------------
 
