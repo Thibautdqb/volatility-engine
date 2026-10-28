@@ -1,11 +1,13 @@
 """Regenerate the figures in docs/img from the Deribit trade tape.
 
-python scripts/make_figures.py --end 2026-10-28 --days 14
+python scripts/make_figures.py
+
+Samples: 2026-10-14 to 2026-10-27 (the period the README was first written on) and
+2026-09-14 to 2026-10-13 (held out, analyzed afterwards with the same parameters).
 """
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -29,20 +31,29 @@ plt.rcParams.update(
 INSTRUMENTS = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
 
 
-def after_episodes(studies) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.2), sharey=True)
-    for ax, s in zip(axes, studies, strict=True):
-        p = s.profile
-        ax.fill_between(p.index, p["ci low"], p["ci high"], alpha=0.25, lw=0)
-        ax.plot(p.index, p["after episode start"], marker="o", ms=3, label="after a new alert")
+def after_episodes(samples: dict[str, list]) -> None:
+    """One panel per instrument, one line per sample, with the unconditional median."""
+    fig, axes = plt.subplots(1, len(INSTRUMENTS), figsize=(9, 3.4), sharey=True)
+    for ax, inst in zip(axes, INSTRUMENTS, strict=True):
+        for label, studies in samples.items():
+            s = next(x for x in studies if x.instrument == inst)
+            p = s.profile
+            ax.fill_between(p.index, p["ci low"], p["ci high"], alpha=0.2, lw=0)
+            ax.plot(
+                p.index,
+                p["after episode start"],
+                marker="o",
+                ms=3,
+                label=f"after an alert, {label} ({len(s.episodes)})",
+            )
         ax.plot(p.index, p["any time"], marker="o", ms=3, color="grey", label="at any time")
         ax.axhline(1, color="black", lw=0.6)
         ax.set_xscale("log")
         ax.set_xticks(p.index, [str(m) for m in p.index])
         ax.set_xlabel("next ... minutes")
-        ax.set_title(f"{s.instrument}, {len(s.episodes)} alerts")
+        ax.set_title(inst)
+        ax.legend(loc="upper right", fontsize=7)
     axes[0].set_ylabel("realized vol / normal vol (median)")
-    axes[0].legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(OUT / "after_alert.png")
 
@@ -82,14 +93,13 @@ def example(study, hours: float = 1.5) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--end", default="2026-10-28")
-    p.add_argument("--days", type=int, default=14)
-    args = p.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    studies = [run_study(i, days=args.days, end=args.end) for i in INSTRUMENTS]
-    after_episodes(studies)
-    example(studies[0])
+    samples = {
+        "Oct 14-27": [run_study(i, days=14, end="2026-10-28") for i in INSTRUMENTS],
+        "Sep 14-Oct 13": [run_study(i, days=30, end="2026-10-14") for i in INSTRUMENTS],
+    }
+    after_episodes(samples)
+    example(samples["Oct 14-27"][0])
 
 
 if __name__ == "__main__":

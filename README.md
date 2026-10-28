@@ -16,11 +16,18 @@ When vol 1m reaches 2× normal, the state goes to `ELEVATED`; at 3×, it goes to
 The repository also replays the detector on the past trade tape and measures what its alerts were worth. Only Deribit's public API is used, so no account or key is needed.
 
 ```
-10s bars | vol 1m = EWMA half-life 60s, normal = 30m | elevated >= 2x, spike >= 3x, reset < 1.5x | 07:58:40 UTC
+10s bars | vol 1m = EWMA half-life 60s, normal = 30m | elevated >= 2x, spike >= 3x, reset < 1.5x | 08:56:20 UTC
 
-                 price    state    for ratio vol 1m normal move 1m 1sd 1m trades  dvol
-BTC-PERPETUAL 80,997.0   NORMAL 12m20s 1.52x  18.5%  12.2%  +0.04%  20.63   2.6x 37.3%
-ETH-PERPETUAL  2,358.5 ELEVATED  1m40s 2.31x  46.7%  20.2%  +0.09%   1.52   2.2x 53.0%
+                 price  state    for ratio vol 1m normal move 1m 1sd 1m trades  dvol
+BTC-PERPETUAL 81,420.5 NORMAL 16m30s 0.77x  27.6%  35.8%  +0.1bp  31.05   0.5x 37.2%
+ETH-PERPETUAL  2,369.9 NORMAL 17m50s 0.34x  18.0%  52.3%  -0.6bp   0.59   0.5x 52.3%
+
+alerts
+08:35:40  ETH-PERPETUAL    normal -> elevated  ratio 2.76x  vol 1m 158.7%  normal  57.5%  move 1m +38.1bp  @ 2,379.8  (history)
+08:35:40  BTC-PERPETUAL    normal -> elevated  ratio 2.35x  vol 1m  72.2%  normal  30.7%  move 1m +18.3bp  @ 81,547.5  (history)
+08:26:40  ETH-PERPETUAL    normal -> spike     ratio 4.20x  vol 1m 192.8%  normal  45.9%  move 1m +40.7bp  @ 2,373.9  (history)
+08:26:40  BTC-PERPETUAL  elevated -> spike     ratio 4.04x  vol 1m  96.1%  normal  23.8%  move 1m +22.4bp  @ 81,322.0  (history)
+08:26:30  BTC-PERPETUAL    normal -> elevated  ratio 2.60x  vol 1m  45.6%  normal  17.6%  move 1m  +7.5bp  @ 81,203.0  (history)
 ```
 
 ![Example](docs/img/example.png)
@@ -28,6 +35,12 @@ ETH-PERPETUAL  2,358.5 ELEVATED  1m40s 2.31x  46.7%  20.2%  +0.09%   1.52   2.2x
 *The largest alert in the sample. At 12:30 UTC, BTC falls 0.9% in 30 seconds and 1.3% within three minutes. The ratio jumps to 5×. The monitor stays at SPIKE for about 4 minutes, then at ELEVATED, and returns to NORMAL 5½ minutes after the move. The ELEVATED alert at 12:05 is a smaller burst that faded on its own.*
 
 ---
+
+## Dashboard
+
+`streamlit run dashboard/app.py` shows the same monitor with the last hours of price and ratio, alert periods shaded (orange = elevated, red = spike), and the alert list.
+
+![Dashboard](docs/img/dashboard.png)
 
 ## What each column means
 
@@ -43,6 +56,8 @@ ETH-PERPETUAL  2,358.5 ELEVATED  1m40s 2.31x  46.7%  20.2%  +0.09%   1.52   2.2x
 | `trades` | trades per bar, fast / slow average | activity often surges together with volatility |
 | `dvol` | Deribit's 30-day implied volatility index | the options market's view, for context |
 
+Alerts marked `(history)` were found in the three hours of trades loaded at start-up. They are listed so the alert list matches the charts, but they are not sent to the alert log.
+
 Alerts are also written with `--log`, one JSON object per line. The record below comes from a replay of 2026-10-14; `dvol` is null because the replay has no DVOL feed.
 
 ```json
@@ -51,29 +66,37 @@ Alerts are also written with `--log`, one JSON object per line. The record below
 
 ## Does it work?
 
-The detector was replayed bar by bar on every Deribit trade from 2026-10-14 to 2026-10-27: 14 days, 4.6 million BTC trades and 1.5 million ETH trades. The parameters (10-second bars, half-lives of 1 and 30 minutes, thresholds 2 / 3 / 1.5) were fixed beforehand from the alert frequency alone and were not tuned on the results below. Reproduce with `volengine study BTC-PERPETUAL --end 2026-10-28`.
+The detector was replayed bar by bar on every Deribit trade over two periods:
+
+- **2026-10-14 to 2026-10-27**: 14 days, 4.6 million BTC and 1.5 million ETH trades. The README was first written on this period.
+- **2026-09-14 to 2026-10-13**: 30 days, 6.5 million BTC and 2.7 million ETH trades, held out and analyzed afterwards without changing anything.
+
+The parameters (10-second bars, half-lives of 1 and 30 minutes, thresholds 2 / 3 / 1.5) were set from the alert frequency alone and were never tuned on the outcomes below. Reproduce with `volengine study BTC-PERPETUAL --end 2026-10-28 --days 14`, or `--end 2026-10-14 --days 30` for the held-out period.
 
 **After an alert, is the next stretch of time more violent?** The sample is cut into non-overlapping 5-minute windows. For each window, the detector's state is read at its start, using past data only. A window is *violent* if its realized volatility is at least 2× the normal volatility at its start.
 
-| | BTC | ETH |
-|---|---:|---:|
-| alerts per day (of which to `SPIKE`) | 15.4 (1.4) | 14.6 (2.1) |
-| time spent flagged | 3.3% | 2.9% |
-| P(next 5 min violent), state `NORMAL` | 1.8% [1.4, 2.2] | 1.9% [1.5, 2.4] |
-| P(next 5 min violent), state `ELEVATED` | 11.8% [6.2, 17.2] | 17.3% [10.1, 24.5] |
-| P(next 5 min violent), state `SPIKE` | 21% [0, 45] | 27% [10, 44] |
-| lift (flagged / not flagged) | **7.2** [4.2, 10.8] | **10.1** [6.1, 15.2] |
-| violent windows already flagged at their start | 20% [12, 27] | 24% [15, 32] |
+| | BTC Oct | BTC Sep (held out) | ETH Oct | ETH Sep (held out) |
+|---|---:|---:|---:|---:|
+| alerts per day (of which to `SPIKE`) | 15.4 (1.4) | 18.0 (2.0) | 14.6 (2.1) | 18.6 (2.7) |
+| time spent flagged | 3.3% | 3.4% | 2.9% | 3.4% |
+| P(next 5 min violent), state `NORMAL` | 1.8% [1.4, 2.2] | 2.0% [1.7, 2.3] | 1.9% [1.5, 2.4] | 2.2% [1.9, 2.6] |
+| P(next 5 min violent), state `ELEVATED` | 12% [6, 17] | 10% [6, 13] | 17% [10, 25] | 10% [7, 14] |
+| P(next 5 min violent), state `SPIKE` | 21% [0, 45] | 31% [15, 48] | 27% [10, 44] | 30% [17, 44] |
+| **lift** (flagged / not flagged) | **7.2** [4.2, 10.8] | **6.2** [4.2, 8.5] | **10.1** [6.1, 15.2] | **5.9** [4.2, 7.8] |
+| violent windows already flagged at their start | 20% [12, 27] | 18% [13, 23] | 24% [15, 32] | 17% [12, 22] |
 
 95% intervals in brackets, from a stationary block bootstrap with one-hour blocks.
 
-**How long does it last?** The figure below shows realized volatility over the next 1 to 60 minutes after each new alert, relative to normal. Alerts are kept only if they are at least 30 minutes apart: 150 on BTC, 142 on ETH.
+- Being flagged makes a violent next five minutes roughly 6 to 10 times more likely, on both instruments and in both periods.
+- In every case, the lower bound of the interval is above 4.
+
+**How long does it last?** The figure below shows realized volatility over the next 1 to 60 minutes after each new alert, relative to normal. Alerts are kept only if they are at least 30 minutes apart.
 
 ![After an alert](docs/img/after_alert.png)
 
-- In the minute after an alert, volatility runs at 1.5× normal on BTC and 1.7× on ETH. At a random moment the median is 0.8×.
-- The excess halves in about 10 minutes and is nearly gone after an hour, at 1.1×.
-- The alert does not predict the first jump. Four out of five violent windows start while the monitor is still at `NORMAL`, because the move arrives in a single print (data releases, liquidations). The alert says that a high-volatility regime has started and that it tends to last several minutes. That is the information a trader can act on.
+- In the minute after an alert, volatility runs at 1.4× to 1.7× normal. At a random moment the median is 0.75×.
+- The excess halves in about 10 minutes and is nearly gone after an hour, at about 1.1×.
+- **The alert does not predict the first jump.** About four out of five violent windows start while the monitor is still at `NORMAL`, because the move arrives in a single print (data releases, liquidations). The alert says that a high-volatility regime has started and that it tends to last several minutes. That is the information a trader can act on.
 
 ## Usage
 
@@ -140,7 +163,7 @@ Design choices:
 
 ## Limitations
 
-- **Two weeks of data.** The study covers 14 days, one market regime. The `SPIKE` rows rest on 14 and 22 windows, hence their wide intervals. Run `volengine study --days 60` for a longer sample.
+- **Six weeks of data.** The two periods together cover 44 days, which is short next to the variety of crypto market conditions. The `SPIKE` rows rest on 14 to 43 windows, hence their wide intervals.
 - **Trade prices, not quotes.** Deribit does not publish historical order-book quotes, so both the study and the monitor use trades to stay identical. Quotes would give a cleaner price on illiquid instruments.
 - **No intraday seasonality model.** The 30-minute normal level adapts to the time of day only gradually. In the sample, 13:00–14:00 UTC (around the US equity open) has more than twice the average hourly number of alerts, and 12:00–16:00 UTC accounts for about a quarter of them. This is intended: those are the hours when volatility actually changes.
 - **Scope.** The study measures how violent the next minutes are, not their direction. It is not a trading signal by itself.
