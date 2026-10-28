@@ -13,7 +13,15 @@ import pandas as pd
 
 HISTORY_URL = "https://history.deribit.com/api/v2"
 _PAGE = 10_000
-TRADE_COLUMNS = ["timestamp", "trade_id", "price", "amount"]
+TRADE_COLUMNS = [
+    "timestamp",
+    "trade_id",
+    "price",
+    "amount",
+    "direction",  # aggressor side: "buy" or "sell"
+    "index_price",  # Deribit spot index at the time of the trade
+    "liquidation",  # empty, or which side(s) were liquidated: "M", "T" or "MT"
+]
 
 
 class DeribitError(RuntimeError):
@@ -56,9 +64,9 @@ class DeribitREST:
     ) -> pd.DataFrame:
         """Every trade in [start, end), oldest first.
 
-        Columns: ``timestamp`` (ms since epoch, exchange time), ``trade_id``, ``price``,
-        ``amount``. Pages are chained on the last timestamp received; trades sharing that
-        millisecond are de-duplicated by id.
+        Columns: see ``TRADE_COLUMNS``; ``timestamp`` is in ms since epoch, exchange time.
+        Pages are chained on the last timestamp received; trades sharing that millisecond
+        are de-duplicated by id.
         """
         start_ms = int(pd.Timestamp(start).timestamp() * 1000)
         end_ms = int(pd.Timestamp(end).timestamp() * 1000) - 1  # the API bound is inclusive
@@ -81,7 +89,8 @@ class DeribitREST:
             cursor = last if last > cursor else cursor + 1
         if not rows:
             return pd.DataFrame(columns=TRADE_COLUMNS)
-        df = pd.DataFrame(rows)[TRADE_COLUMNS]
+        df = pd.DataFrame(rows).reindex(columns=TRADE_COLUMNS)
+        df["liquidation"] = df["liquidation"].fillna("")
         df["trade_id"] = df["trade_id"].astype(str)
         df = df.drop_duplicates("trade_id").sort_values("timestamp", kind="stable")
         return df.reset_index(drop=True)

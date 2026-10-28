@@ -87,3 +87,12 @@ class GridSampler:
             return []
         b = now_ms // self.step
         return self._roll(b) if b > self.bucket else []
+
+
+def bar_counts(trades: pd.DataFrame, closes: pd.Series, bar_seconds: float) -> pd.Series:
+    """Number of trades in each bar of ``closes`` (zero for empty bars)."""
+    step = bar_ms(bar_seconds)
+    n = pd.Series(1, index=trades["timestamp"].to_numpy(dtype=np.int64) // step).groupby(level=0)
+    n = n.sum()
+    n.index = pd.to_datetime(n.index.to_numpy() * step, unit="ms", utc=True)
+    return n.reindex(closes.index).fillna(0).astype(int)
