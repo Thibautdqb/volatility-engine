@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "volengine"
-version = "0.1.0"
-description = "Crypto volatility on Deribit: streaming realized-volatility estimators, GARCH forecast evaluation and the implied-realized variance risk premium."
+version = "0.2.0"
+description = "Real-time short-term volatility spike monitor for Deribit BTC and ETH perpetuals, with a historical evaluation of its alerts."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Thibautdqb" }]
-keywords = ["volatility", "garch", "ewma", "deribit", "options", "quantitative-finance"]
+keywords = ["volatility", "ewma", "deribit", "crypto", "market-microstructure", "quantitative-finance"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -31,8 +31,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
-    "arch>=7.0",
-    "statsmodels>=0.14",
     "matplotlib>=3.8",
 ]
 

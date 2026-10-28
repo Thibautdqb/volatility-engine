@@ -1,39 +1,36 @@
 import numpy as np
 import pandas as pd
-import pytest
+
+SECONDS_PER_YEAR = 365 * 24 * 3600
 
 
-def simulate_garch(n, omega, alpha, beta, seed=0, df=None):
+def simulate_trades(
+    seconds, vol, rate=2.0, start="2026-01-01", seed=0, jumps_per_day=0.0, jump_sd=0.0
+):
+    """Trade tape from a driftless random walk observed at Poisson trade times.
+
+    ``vol`` is the annualized volatility, either a constant or an array with one value
+    per second. Independent jumps (compound Poisson, normal log sizes with standard
+    deviation ``jump_sd``) can be added to get fat tails without volatility clustering.
+    Returns columns ``timestamp`` (ms), ``trade_id``, ``price``, ``amount``.
+    """
     rng = np.random.default_rng(seed)
-    r = np.empty(n)
-    s2 = omega / (1 - alpha - beta)
-    for t in range(n):
-        z = rng.standard_normal() if df is None else rng.standard_t(df) / np.sqrt(df / (df - 2))
-        r[t] = np.sqrt(s2) * z
-        s2 = omega + alpha * r[t] ** 2 + beta * s2
-    return r
-
-
-def simulate_gbm_ohlc(n_bars, sigma_annual, steps_per_bar=500, periods=365.0, seed=0):
-    """OHLC bars from a finely sampled driftless GBM; returns (df, per-bar sigma)."""
-    rng = np.random.default_rng(seed)
-    sigma_bar = sigma_annual / np.sqrt(periods)
-    dz = rng.standard_normal((n_bars, steps_per_bar)) * sigma_bar / np.sqrt(steps_per_bar)
-    logp = np.log(100.0) + np.cumsum(dz.ravel()).reshape(n_bars, steps_per_bar)
-    prev_close = np.r_[np.log(100.0), logp[:-1, -1]]
-    paths = np.column_stack([prev_close, logp])
-    df = pd.DataFrame(
+    vol = np.broadcast_to(np.asarray(vol, dtype=float), (seconds,))
+    # Log price on a 100 ms grid, then sampled at the trade times.
+    steps = seconds * 10
+    sd = np.repeat(vol, 10) * np.sqrt(0.1 / SECONDS_PER_YEAR)
+    dlogp = rng.standard_normal(steps) * sd
+    jumps = rng.random(steps) < jumps_per_day / 864_000
+    dlogp[jumps] += rng.standard_normal(jumps.sum()) * jump_sd
+    logp = np.log(50_000.0) + np.cumsum(dlogp)
+    n = rng.poisson(rate * seconds)
+    t_ms = np.sort(rng.integers(0, seconds * 1000, size=n))
+    t0 = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    return pd.DataFrame(
         {
-            "open": np.exp(paths[:, 0]),
-            "high": np.exp(paths.max(axis=1)),
-            "low": np.exp(paths.min(axis=1)),
-            "close": np.exp(paths[:, -1]),
-        },
-        index=pd.date_range("2024-01-01", periods=n_bars, freq="D", tz="UTC"),
+            "timestamp": t0 + t_ms,
+            "trade_id": np.arange(n).astype(str),
+            "price": np.exp(logp[t_ms // 100]),
+            "amount": 1.0,
+        }
     )
-    return df, sigma_bar
-
-
-@pytest.fixture(scope="session")
-def garch_returns():
-    return simulate_garch(4000, 2e-6, 0.08, 0.90, seed=1, df=6)

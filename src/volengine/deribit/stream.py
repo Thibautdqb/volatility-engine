@@ -2,8 +2,8 @@
 
 Only public channels are used, so no API key is required:
 
-* ``trades.{instrument}.100ms``: every trade print. Bars built from it have the
-  same definition as the REST candles used for seeding (trade OHLC).
+* ``trades.{instrument}.100ms``: every trade print, the same tape the history
+  server returns, so live and historical bars have one definition.
 * ``deribit_volatility_index.{index}``: DVOL, the 30-day implied volatility index.
 
 The connection is kept alive with Deribit's heartbeat mechanism and re-established
@@ -29,15 +29,16 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Trade:
     instrument: str
-    timestamp: float  # seconds since epoch, exchange time
+    timestamp_ms: int  # exchange time
     price: float
     amount: float
+    trade_id: str = ""
 
 
 @dataclass(frozen=True)
 class DvolUpdate:
     index_name: str
-    timestamp: float
+    timestamp_ms: int
     value: float  # annualized vol in percent
 
 
@@ -60,9 +61,10 @@ def parse_message(message: dict) -> list[Event]:
         return [
             Trade(
                 instrument=t["instrument_name"],
-                timestamp=t["timestamp"] / 1000.0,
+                timestamp_ms=int(t["timestamp"]),
                 price=float(t["price"]),
                 amount=float(t["amount"]),
+                trade_id=str(t["trade_id"]),
             )
             for t in data
         ]
@@ -70,7 +72,7 @@ def parse_message(message: dict) -> list[Event]:
         return [
             DvolUpdate(
                 index_name=data["index_name"],
-                timestamp=data["timestamp"] / 1000.0,
+                timestamp_ms=int(data["timestamp"]),
                 value=float(data["volatility"]),
             )
         ]

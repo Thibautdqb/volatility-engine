@@ -1,14 +1,15 @@
-"""Streaming volatility monitor.
+"""Live spike monitor on Deribit perpetuals.
 
-Trades are aggregated into fixed-length bars aligned on the epoch. Each completed
-bar updates an O(1) EWMA variance and a rolling window of OHLC bars used for the
-range-based estimators.
+Start-up sequence, also replayed after every reconnection:
 
-Live bars and the historical bars used to seed the monitor share one definition
-(trade-price OHLC from the same exchange), so the series is continuous. Seeding
-uses completed historical bars only, never interpolated prices: interpolation
-invents zero-variance returns and biases the estimate downward. After a dropped
-connection the monitor re-seeds from REST, so the gap is filled with real bars.
+1. subscribe to the trade stream and buffer what arrives;
+2. download the last two hours of trades from the history server and run the
+   detector over them, so the slow (normal) volatility is warm from the first bar;
+3. replay the buffered trades that the download did not contain, then go live.
+
+Bars close on exchange time: any message (a trade or a DVOL update, roughly once per
+second) closes the bars that ended more than ``GRACE_MS`` earlier, so a quiet market
+still produces bars on schedule.
 """
 
 from __future__ import annotations
@@ -18,139 +19,139 @@ import logging
 import math
 import threading
 from collections import deque
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
-from volengine import estimators as est
-from volengine.deribit.rest import RESOLUTIONS, DeribitREST
+from volengine.deribit.rest import DeribitREST
 from volengine.deribit.stream import DeribitStream, DvolUpdate, Event, Reconnected, Trade
+from volengine.detector import SECONDS_PER_YEAR, DetectorConfig, Level, SpikeDetector
+from volengine.sampling import GridSampler, bar_closes
 
 log = logging.getLogger(__name__)
 
 DVOL_INDEX = {"BTC": "btc_usd", "ETH": "eth_usd"}
-
-
-@dataclass
-class Bar:
-    start: float
-    open: float
-    high: float
-    low: float
-    close: float
-
-
-class BarAggregator:
-    """Build epoch-aligned OHLC bars from a trade stream.
-
-    ``after`` is the start time of the last bar already known (e.g. from history):
-    trades belonging to that bar or earlier are ignored.
-    """
-
-    def __init__(self, bar_seconds: float, after: float | None = None):
-        self.bar_seconds = bar_seconds
-        self._min_bucket = None if after is None else int(after // bar_seconds) + 1
-        self._bucket: int | None = None
-        self._bar: Bar | None = None
-
-    def update(self, timestamp: float, price: float) -> list[Bar]:
-        bucket = int(timestamp // self.bar_seconds)
-        done: list[Bar] = []
-        if self._min_bucket is not None and bucket < self._min_bucket:
-            return done
-        if self._bar is None:
-            self._bucket = bucket
-            self._bar = Bar(bucket * self.bar_seconds, price, price, price, price)
-            return done
-        if bucket < self._bucket:  # late tick, ignore
-            return done
-        if bucket > self._bucket:
-            done.append(self._bar)
-            last = self._bar.close
-            # Buckets without trades: the price did not move, emit flat bars to keep a regular grid.
-            for b in range(self._bucket + 1, bucket):
-                done.append(Bar(b * self.bar_seconds, last, last, last, last))
-            self._bucket = bucket
-            self._bar = Bar(bucket * self.bar_seconds, price, price, price, price)
-            return done
-        bar = self._bar
-        bar.high = max(bar.high, price)
-        bar.low = min(bar.low, price)
-        bar.close = price
-        return done
-
-
-class StreamingEWMA:
-    """sigma2 <- lam * sigma2 + (1 - lam) * r^2, holding the forecast for the next bar."""
-
-    def __init__(self, lam: float, variance: float | None = None):
-        if not 0 < lam < 1:
-            raise ValueError("lambda must be in (0, 1)")
-        self.lam = lam
-        self.variance = variance
-
-    def update(self, r: float) -> float:
-        if self.variance is None:
-            self.variance = r * r
-        else:
-            self.variance = self.lam * self.variance + (1.0 - self.lam) * r * r
-        return self.variance
-
-    @classmethod
-    def from_half_life(cls, half_life_bars: float, **kw) -> StreamingEWMA:
-        return cls(0.5 ** (1.0 / half_life_bars), **kw)
+GRACE_MS = 1000  # trades are pushed in 100 ms batches; wait before closing a bar
+HISTORY_BARS = 2160  # bars kept for charts (6 hours of 10-second bars)
 
 
 @dataclass(frozen=True)
 class Snapshot:
+    """What a trader needs at a glance, refreshed on every bar."""
+
     instrument: str
-    time: pd.Timestamp
+    time: pd.Timestamp  # end of the last completed bar
     price: float
-    bars: int
-    lam: float
-    ewma: float
-    close_to_close: float
-    cc_lower: float
-    cc_upper: float
-    parkinson: float
-    garman_klass: float
-    yang_zhang: float
+    level: Level
+    level_since: pd.Timestamp
+    ratio: float  # fast / slow volatility
+    fast_vol: float  # annualized, last ~minute
+    slow_vol: float  # annualized, last ~30 minutes
+    move_1m: float  # log return over the last minute
+    sigma_1m: float  # one-standard-deviation price move over one minute at the current vol
+    activity: float  # trade rate, fast / slow
+    dvol: float | None  # 30-day implied volatility
+
+
+@dataclass(frozen=True)
+class Alert:
+    time: pd.Timestamp
+    instrument: str
+    level: Level
+    previous: Level
+    ratio: float
+    fast_vol: float
+    slow_vol: float
+    price: float
+    move_1m: float
     dvol: float | None
 
     def as_dict(self) -> dict:
-        return self.__dict__.copy()
+        d = {k: round(v, 6) if isinstance(v, float) else v for k, v in asdict(self).items()}
+        d["time"] = self.time.isoformat()
+        d["level"], d["previous"] = self.level.name.lower(), self.previous.name.lower()
+        return d
+
+
+class _Rate:
+    """Fast and slow EWMA of the number of trades per bar."""
+
+    def __init__(self, config: DetectorConfig, init: float):
+        self.lf, self.ls = config.lam_fast, config.lam_slow
+        self.fast = self.slow = init
+
+    def update(self, n: int) -> None:
+        self.fast = self.lf * self.fast + (1 - self.lf) * n
+        self.slow = self.ls * self.slow + (1 - self.ls) * n
+
+    @property
+    def ratio(self) -> float:
+        return self.fast / self.slow if self.slow > 0 else float("nan")
 
 
 class _InstrumentState:
-    def __init__(self, bar_seconds: float, window: int, lam: float):
-        self.aggregator = BarAggregator(bar_seconds)
-        self.bars: deque[Bar] = deque(maxlen=window)
-        self.ewma = StreamingEWMA(lam)
-        self.history: deque[tuple[float, float]] = deque(maxlen=5000)  # (bar start, ewma var)
-        self.last_price: float | None = None
-        self.last_time: float | None = None
+    def __init__(self, config: DetectorConfig):
+        self.config = config
+        self.sampler = GridSampler(config.bar_seconds)
+        self.detector: SpikeDetector | None = None
+        self.rate: _Rate | None = None
+        per_minute = max(1, round(60 / config.bar_seconds))
+        self.closes: deque[float] = deque(maxlen=per_minute + 1)
+        self.history: deque[tuple] = deque(maxlen=HISTORY_BARS)
+        self.level_since: float | None = None
+        self.last_bar_ms: int | None = None
+        self.seed_end: tuple[int, set[str]] | None = None  # last downloaded trade
+        self.warm: list[tuple[int, float, float, int]] = []  # bars seen before the detector starts
+
+    def add_bar(self, start_ms: int, close: float, n_trades: int) -> tuple[Level, Level] | None:
+        """Feed one completed bar; returns (previous, new) level when it escalated."""
+        prev_close = self.closes[-1] if self.closes else None
+        self.closes.append(close)
+        self.last_bar_ms = start_ms
+        if prev_close is None:
+            return None
+        r = math.log(close / prev_close)
+        if self.detector is not None:
+            return self._step(start_ms, close, r, n_trades)
+        # Same start-up as run_detector: initialize on the warm-up sample, then replay it.
+        self.warm.append((start_ms, close, r, n_trades))
+        if len(self.warm) < self.config.warmup_bars:
+            return None
+        var = float(np.mean([w[2] ** 2 for w in self.warm]))
+        self.detector = SpikeDetector(self.config, variance=max(var, 1e-12))
+        self.rate = _Rate(self.config, max(float(np.mean([w[3] for w in self.warm])), 1e-6))
+        for w in self.warm:
+            self._step(*w)
+        self.warm = []
+        return None
+
+    def _step(self, start_ms: int, close: float, r: float, n_trades: int):
+        before = self.detector.level
+        rd = self.detector.update(r)
+        self.rate.update(n_trades)
+        end_ms = start_ms + self.sampler.step
+        if rd.level != before or self.level_since is None:
+            self.level_since = end_ms / 1000.0
+        ppy = self.config.bars_per_year
+        fast, slow = math.sqrt(rd.fast_var * ppy), math.sqrt(rd.slow_var * ppy)
+        self.history.append((end_ms, close, fast, slow, rd.ratio, int(rd.level)))
+        return (before, rd.level) if rd.escalated else None
 
 
-class LiveVolMonitor:
+class LiveSpikeMonitor:
     def __init__(
         self,
         instruments: Iterable[str],
-        bar_seconds: float = 60.0,
-        window: int = 120,
-        half_life_seconds: float | None = None,
-        level: float = 0.95,
+        config: DetectorConfig | None = None,
+        on_alert: Callable[[Alert], None] | None = None,
     ):
-        self.bar_seconds = bar_seconds
-        self.window = window
-        self.level = level
-        self.periods = est.periods_per_year(bar_seconds, "crypto")
-        self._half_life = half_life_seconds
-        default_lam = 0.5 ** (bar_seconds / (half_life_seconds or 3600.0))
-        self._state = {i: _InstrumentState(bar_seconds, window, default_lam) for i in instruments}
+        self.config = config or DetectorConfig()
+        self._state = {i: _InstrumentState(self.config) for i in instruments}
         self._dvol: dict[str, float] = {}
+        self._alerts: deque[Alert] = deque(maxlen=500)
+        self._on_alert = on_alert
         self._lock = threading.Lock()
 
     @property
@@ -159,143 +160,178 @@ class LiveVolMonitor:
 
     @property
     def dvol_indices(self) -> list[str]:
-        return sorted(
-            {DVOL_INDEX[i.split("-")[0]] for i in self._state if i.split("-")[0] in DVOL_INDEX}
-        )
+        roots = {i.split("-")[0] for i in self._state}
+        return sorted(DVOL_INDEX[r] for r in roots if r in DVOL_INDEX)
+
+    @property
+    def seed_span(self) -> pd.Timedelta:
+        """History downloaded at start-up: the warm-up plus as much again for the charts."""
+        return pd.Timedelta(seconds=1.5 * self.config.warmup_bars * self.config.bar_seconds)
 
     # -- seeding ------------------------------------------------------------
 
-    def seed(self, rest: DeribitREST, lookback_bars: int = 2000) -> None:
-        """(Re)initialize every instrument from completed historical trade bars."""
-        native = {v: k for k, v in RESOLUTIONS.items()}
-        for instrument in self._state:
-            res = native.get(int(self.bar_seconds), "1")
-            res_seconds = RESOLUTIONS[res]
-            end = pd.Timestamp.now(tz="UTC")
-            start = end - pd.Timedelta(seconds=res_seconds * lookback_bars)
-            hist = rest.ohlc(instrument, res, start, end)
-            # Drop the bar still in progress: it would be duplicated by the live stream.
-            hist = hist[hist.index + pd.Timedelta(seconds=res_seconds) <= end]
-            if len(hist) < 50:
-                log.warning("not enough history to seed %s", instrument)
-                continue
-            with self._lock:
-                old = self._state[instrument]
-                st = _InstrumentState(self.bar_seconds, self.window, old.ewma.lam)
-                st.aggregator = BarAggregator(self.bar_seconds, after=hist.index[-1].timestamp())
-            r = est.log_returns(hist["close"])
-            # Variance scales linearly with horizon under a random walk.
-            scale = self.bar_seconds / res_seconds
-            if self._half_life is None and len(r) >= 200:
-                lam_native = est.fit_ewma_lambda(r)
-                st.ewma.lam = lam_native**scale
-            lam_native = st.ewma.lam ** (1.0 / scale)
-            st.ewma.variance = float(est.ewma_variance(r.to_numpy(), lam_native)[-1]) * scale
-            if res_seconds == self.bar_seconds:
-                path = est.ewma_variance(r.to_numpy(), st.ewma.lam)
-                st.history.extend(zip((t.timestamp() for t in r.index), path, strict=False))
-                for ts, row in hist.tail(self.window).iterrows():
-                    st.bars.append(Bar(ts.timestamp(), row.open, row.high, row.low, row.close))
-            st.last_price = float(hist["close"].iloc[-1])
-            st.last_time = hist.index[-1].timestamp() + res_seconds
+    def fetch_seed(self, rest: DeribitREST, end: pd.Timestamp | None = None) -> dict:
+        end = end or pd.Timestamp.now(tz="UTC")
+        return {i: rest.trades(i, end - self.seed_span, end) for i in self._state}
+
+    def apply_seed(self, trades: dict[str, pd.DataFrame]) -> None:
+        """Rebuild every instrument's state from a trade history, without raising alerts."""
+        for instrument, df in trades.items():
+            st = _InstrumentState(self.config)
+            if len(df):
+                closes = bar_closes(df, self.config.bar_seconds)
+                step = st.sampler.step
+                buckets = df["timestamp"].to_numpy(dtype=np.int64) // step
+                counts = pd.Series(1, index=buckets).groupby(level=0).sum()
+                epoch = pd.Timestamp(0, tz="UTC")
+                starts = ((closes.index - epoch) // pd.Timedelta(milliseconds=1)).to_numpy()
+                # Completed bars go through the detector; the last one is still in progress.
+                for t, c in zip(starts[:-1], closes.to_numpy()[:-1], strict=True):
+                    st.add_bar(int(t), float(c), int(counts.get(t // step, 0)))
+                last = int(starts[-1] // step)
+                st.sampler = GridSampler(self.config.bar_seconds, last, float(closes.iloc[-1]))
+                st.sampler.trades = int(counts.get(last, 0))
+                st.seed_end = (int(df["timestamp"].iloc[-1]), set(df["trade_id"].iloc[-200:]))
             with self._lock:
                 self._state[instrument] = st
-            log.info("seeded %s with %d bars, lambda=%.4f", instrument, len(hist), st.ewma.lam)
+            log.info("seeded %s with %d trades", instrument, len(df))
 
     # -- event handling -----------------------------------------------------
 
-    def on_event(self, event: Event) -> bool:
-        """Process an event; returns True when at least one bar completed."""
+    def on_event(self, event: Event) -> list[Alert]:
+        """Process one stream event; returns the alerts it triggered."""
+        alerts: list[Alert] = []
         with self._lock:
             if isinstance(event, DvolUpdate):
                 self._dvol[event.index_name] = event.value / 100.0
-                return False
-            if not isinstance(event, Trade) or event.instrument not in self._state:
-                return False
-            st = self._state[event.instrument]
-            st.last_price, st.last_time = event.price, event.timestamp
-            completed = st.aggregator.update(event.timestamp, event.price)
-            for bar in completed:
-                prev = st.bars[-1].close if st.bars else None
-                if prev is not None and prev > 0:
-                    st.ewma.update(math.log(bar.close / prev))
-                    st.history.append((bar.start, st.ewma.variance))
-                st.bars.append(bar)
-            return bool(completed)
+            elif isinstance(event, Trade) and event.instrument in self._state:
+                st = self._state[event.instrument]
+                seed_end = st.seed_end
+                if seed_end and (
+                    event.timestamp_ms < seed_end[0]
+                    or (event.timestamp_ms == seed_end[0] and event.trade_id in seed_end[1])
+                ):
+                    return alerts  # already in the downloaded history
+                bars = st.sampler.update(event.timestamp_ms, event.price)
+                alerts += self._add_bars(event.instrument, st, bars)
+            now = getattr(event, "timestamp_ms", None)
+            if now is not None:
+                for name, st in self._state.items():
+                    alerts += self._add_bars(name, st, st.sampler.advance(now - GRACE_MS))
+        for a in alerts:
+            if self._on_alert is not None:
+                self._on_alert(a)
+        return alerts
+
+    def _add_bars(self, instrument: str, st: _InstrumentState, bars) -> list[Alert]:
+        out = []
+        for start_ms, close, n in bars:
+            change = st.add_bar(start_ms, close, n)
+            if change is not None:
+                snap = self._snapshot(instrument, st)
+                alert = Alert(
+                    time=snap.time,
+                    instrument=instrument,
+                    level=change[1],
+                    previous=change[0],
+                    ratio=snap.ratio,
+                    fast_vol=snap.fast_vol,
+                    slow_vol=snap.slow_vol,
+                    price=snap.price,
+                    move_1m=snap.move_1m,
+                    dvol=snap.dvol,
+                )
+                self._alerts.append(alert)
+                out.append(alert)
+        return out
 
     # -- output ------------------------------------------------------------
 
-    def snapshot(self, instrument: str) -> Snapshot | None:
-        with self._lock:
-            st = self._state[instrument]
-            if st.ewma.variance is None or st.last_price is None:
-                return None
-            bars = list(st.bars)
-            lam, ewma_var = st.ewma.lam, st.ewma.variance
-            dvol = self._dvol.get(DVOL_INDEX.get(instrument.split("-")[0], ""))
-            last_time, price = st.last_time, st.last_price
-
-        nan = float("nan")
-        cc = lo = hi = pk = gk = yz = nan
-        if len(bars) >= 10:
-            df = pd.DataFrame([b.__dict__ for b in bars])
-            r = np.diff(np.log(df["close"].to_numpy()))
-            n = r.size
-            v = r @ r / n
-            alpha = 1 - self.level
-            # chi2 interval: cheap enough to recompute on every bar; assumes iid normal returns.
-            cc = math.sqrt(v * self.periods)
-            lo = math.sqrt(n * v / stats.chi2.ppf(1 - alpha / 2, n) * self.periods)
-            hi = math.sqrt(n * v / stats.chi2.ppf(alpha / 2, n) * self.periods)
-            pk = math.sqrt(max(est.parkinson(df), 0) * self.periods)
-            gk = math.sqrt(max(est.garman_klass(df), 0) * self.periods)
-            yz = math.sqrt(max(est.yang_zhang(df), 0) * self.periods)
-        ts = (
-            pd.Timestamp(last_time, unit="s", tz="UTC") if last_time else pd.Timestamp.now(tz="UTC")
-        )
+    def _snapshot(self, instrument: str, st: _InstrumentState) -> Snapshot | None:
+        if st.detector is None or not st.history:
+            return None
+        det, ppy = st.detector, self.config.bars_per_year
+        fast = math.sqrt(det.fast_var * ppy)
+        price = st.closes[-1]
+        full_minute = len(st.closes) == st.closes.maxlen
         return Snapshot(
             instrument=instrument,
-            time=ts,
+            time=pd.Timestamp(st.history[-1][0], unit="ms", tz="UTC"),
             price=price,
-            bars=len(bars),
-            lam=lam,
-            ewma=math.sqrt(ewma_var * self.periods),
-            close_to_close=cc,
-            cc_lower=lo,
-            cc_upper=hi,
-            parkinson=pk,
-            garman_klass=gk,
-            yang_zhang=yz,
-            dvol=dvol,
+            level=det.level,
+            level_since=pd.Timestamp(st.level_since, unit="s", tz="UTC"),
+            ratio=det.ratio,
+            fast_vol=fast,
+            slow_vol=math.sqrt(det.slow_var * ppy),
+            move_1m=math.log(price / st.closes[0]) if full_minute else float("nan"),
+            sigma_1m=price * fast * math.sqrt(60.0 / SECONDS_PER_YEAR),
+            activity=st.rate.ratio,
+            dvol=self._dvol.get(DVOL_INDEX.get(instrument.split("-")[0], "")),
         )
 
-    def history(self, instrument: str) -> pd.Series:
-        """Annualized EWMA volatility path (seed + live), indexed by bar time."""
+    def snapshot(self, instrument: str) -> Snapshot | None:
         with self._lock:
-            h = list(self._state[instrument].history)
-        if not h:
-            return pd.Series(dtype=float, name=instrument)
-        t, v = zip(*h, strict=False)
-        idx = pd.to_datetime(np.array(t), unit="s", utc=True)
-        return pd.Series(np.sqrt(np.array(v) * self.periods), index=idx, name=instrument)
+            return self._snapshot(instrument, self._state[instrument])
 
     def snapshots(self) -> list[Snapshot]:
         return [s for s in (self.snapshot(i) for i in self._state) if s is not None]
 
+    def alerts(self) -> list[Alert]:
+        with self._lock:
+            return list(self._alerts)
+
+    def history(self, instrument: str) -> pd.DataFrame:
+        """Recent bars: price, fast and slow annualized vol, ratio and level."""
+        with self._lock:
+            rows = list(self._state[instrument].history)
+        cols = ["time", "price", "fast_vol", "slow_vol", "ratio", "level"]
+        df = pd.DataFrame(rows, columns=cols)
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        return df.set_index("time")
+
     # -- runners -----------------------------------------------------------
 
     async def run(
-        self, stream: DeribitStream | None = None, on_bar=None, rest: DeribitREST | None = None
+        self,
+        stream: DeribitStream | None = None,
+        rest: DeribitREST | None = None,
+        on_bar: Callable[[LiveSpikeMonitor], None] | None = None,
     ) -> None:
+        """Consume the stream forever, seeding at start and after every reconnection."""
         stream = stream or DeribitStream(self.instruments, self.dvol_indices)
+        rest = rest or DeribitREST()
+        buffer: list[Event] = []
+        seeding: asyncio.Future | None = None
         async for event in stream.events():
-            if isinstance(event, Reconnected):
-                log.info("reconnected, backfilling the gap from REST")
-                api = rest or DeribitREST()
-                await asyncio.to_thread(self.seed, api)
+            if isinstance(event, Reconnected) or seeding is None:
+                log.info("downloading recent trades to seed the detector")
+                buffer = []
+                seeding = asyncio.ensure_future(asyncio.to_thread(self.fetch_seed, rest))
+                if isinstance(event, Reconnected):
+                    continue
+            if not seeding.done():
+                buffer.append(event)
                 continue
-            if self.on_event(event) and on_bar is not None:
+            if buffer is not None:
+                try:
+                    self.apply_seed(seeding.result())
+                except Exception:
+                    log.exception("seeding failed, retrying")
+                    seeding = None
+                    continue
+                pending, buffer = [*buffer, event], None
+                for ev in pending:
+                    self.on_event(ev)
+                if on_bar is not None:
+                    on_bar(self)
+                continue
+            before = self._last_bars()
+            self.on_event(event)
+            if on_bar is not None and self._last_bars() != before:
                 on_bar(self)
+
+    def _last_bars(self) -> tuple:
+        return tuple(st.last_bar_ms for st in self._state.values())
 
     def start_background(self) -> threading.Thread:
         """Run the stream in a daemon thread (used by the dashboard)."""

@@ -1,4 +1,8 @@
-"""Deribit public REST API (no credentials required)."""
+"""Deribit public REST API (no credentials required).
+
+Trades come from ``history.deribit.com``, which serves the full trade tape with up to
+10,000 trades per request and is updated within seconds of the live exchange.
+"""
 
 from __future__ import annotations
 
@@ -7,24 +11,9 @@ import time
 import httpx
 import pandas as pd
 
-BASE_URL = "https://www.deribit.com/api/v2"
-
-# Deribit resolution codes -> bar length in seconds
-RESOLUTIONS = {
-    "1": 60,
-    "3": 180,
-    "5": 300,
-    "10": 600,
-    "15": 900,
-    "30": 1800,
-    "60": 3600,
-    "120": 7200,
-    "180": 10800,
-    "360": 21600,
-    "720": 43200,
-    "1D": 86400,
-}
-_MAX_POINTS = 5000
+HISTORY_URL = "https://history.deribit.com/api/v2"
+_PAGE = 10_000
+TRADE_COLUMNS = ["timestamp", "trade_id", "price", "amount"]
 
 
 class DeribitError(RuntimeError):
@@ -32,7 +21,7 @@ class DeribitError(RuntimeError):
 
 
 class DeribitREST:
-    def __init__(self, base_url: str = BASE_URL, timeout: float = 15.0, retries: int = 3):
+    def __init__(self, base_url: str = HISTORY_URL, timeout: float = 60.0, retries: int = 4):
         self._client = httpx.Client(base_url=base_url, timeout=timeout)
         self._retries = retries
 
@@ -62,80 +51,37 @@ class DeribitREST:
                 time.sleep(2**attempt)
         raise DeribitError(f"{method} failed after {self._retries} attempts: {last}")
 
-    def ohlc(
-        self,
-        instrument: str,
-        resolution: str = "1",
-        start: pd.Timestamp | None = None,
-        end: pd.Timestamp | None = None,
+    def trades(
+        self, instrument: str, start: pd.Timestamp, end: pd.Timestamp, page: int = _PAGE
     ) -> pd.DataFrame:
-        """Trade-based OHLCV bars, paginated over the 5000-points-per-call limit."""
-        if resolution not in RESOLUTIONS:
-            raise ValueError(f"resolution must be one of {list(RESOLUTIONS)}")
-        step_ms = RESOLUTIONS[resolution] * 1000
-        end_ms = int((end or pd.Timestamp.now(tz="UTC")).timestamp() * 1000)
-        start_ms = int(
-            (start or pd.Timestamp(end_ms, unit="ms") - pd.Timedelta(days=1)).timestamp() * 1000
-        )
+        """Every trade in [start, end), oldest first.
 
-        frames = []
+        Columns: ``timestamp`` (ms since epoch, exchange time), ``trade_id``, ``price``,
+        ``amount``. Pages are chained on the last timestamp received; trades sharing that
+        millisecond are de-duplicated by id.
+        """
+        start_ms = int(pd.Timestamp(start).timestamp() * 1000)
+        end_ms = int(pd.Timestamp(end).timestamp() * 1000) - 1  # the API bound is inclusive
+        rows: list[dict] = []
         cursor = start_ms
-        while cursor < end_ms:
-            chunk_end = min(end_ms, cursor + step_ms * (_MAX_POINTS - 1))
+        while cursor <= end_ms:
             res = self._get(
-                "get_tradingview_chart_data",
+                "get_last_trades_by_instrument_and_time",
                 instrument_name=instrument,
-                resolution=resolution,
                 start_timestamp=cursor,
-                end_timestamp=chunk_end,
+                end_timestamp=end_ms,
+                count=page,
+                sorting="asc",
             )
-            if res.get("status") == "ok" and res["ticks"]:
-                frames.append(
-                    pd.DataFrame(
-                        {k: res[k] for k in ("open", "high", "low", "close", "volume")},
-                        index=pd.to_datetime(res["ticks"], unit="ms", utc=True),
-                    )
-                )
-            cursor = chunk_end + step_ms
-        if not frames:
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        df = pd.concat(frames)
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        df.index.name = "time"
-        return df
-
-    def dvol(
-        self,
-        currency: str = "BTC",
-        resolution: str = "1D",
-        start: pd.Timestamp | None = None,
-        end: pd.Timestamp | None = None,
-    ) -> pd.DataFrame:
-        """Deribit Volatility Index (30-day implied vol, in vol points) as OHLC."""
-        if resolution not in {"1", "60", "3600", "43200", "1D"}:
-            raise ValueError("DVOL resolution is in seconds: 1, 60, 3600, 43200 or 1D")
-        end_ms = int((end or pd.Timestamp.now(tz="UTC")).timestamp() * 1000)
-        start_ms = int((start or pd.Timestamp("2021-03-24", tz="UTC")).timestamp() * 1000)
-        rows: list[list[float]] = []
-        cursor_end = end_ms
-        while True:
-            res = self._get(
-                "get_volatility_index_data",
-                currency=currency,
-                resolution=resolution,
-                start_timestamp=start_ms,
-                end_timestamp=cursor_end,
-            )
-            rows.extend(res["data"])
-            cont = res.get("continuation")
-            if not cont or not res["data"] or cont <= start_ms:
+            batch = res["trades"]
+            rows.extend(batch)
+            if not res.get("has_more") or not batch:
                 break
-            cursor_end = cont
-        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close"])
-        df.index = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
-        df = df[~df.index.duplicated()].sort_index()
-        df.index.name = "time"
-        return df
-
-    def index_price(self, index_name: str = "btc_usd") -> float:
-        return float(self._get("get_index_price", index_name=index_name)["index_price"])
+            last = batch[-1]["timestamp"]
+            cursor = last if last > cursor else cursor + 1
+        if not rows:
+            return pd.DataFrame(columns=TRADE_COLUMNS)
+        df = pd.DataFrame(rows)[TRADE_COLUMNS]
+        df["trade_id"] = df["trade_id"].astype(str)
+        df = df.drop_duplicates("trade_id").sort_values("timestamp", kind="stable")
+        return df.reset_index(drop=True)

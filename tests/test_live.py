@@ -1,12 +1,15 @@
-import math
+import asyncio
+import json
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from volengine.deribit.stream import DvolUpdate, Trade, parse_message
-from volengine.estimators import ewma_variance
-from volengine.live import BarAggregator, LiveVolMonitor, StreamingEWMA
+from tests.conftest import simulate_trades
+from volengine.deribit.stream import DvolUpdate, Reconnected, Trade, parse_message
+from volengine.detector import DetectorConfig, Level, run_detector
+from volengine.live import LiveSpikeMonitor
+from volengine.sampling import bar_closes, log_returns
 
 TRADES_MSG = {
     "jsonrpc": "2.0",
@@ -45,111 +48,119 @@ DVOL_MSG = {
         "data": {"timestamp": 1793124671248, "index_name": "btc_usd", "volatility": 37.36},
     },
 }
+INSTRUMENT = "BTC-PERPETUAL"
+CONFIG = DetectorConfig(bar_seconds=10, fast_half_life=60, slow_half_life=600)
 
 
-def test_parse_trades():
-    events = parse_message(TRADES_MSG)
-    assert [type(e) for e in events] == [Trade, Trade]
-    assert events[0].instrument == "BTC-PERPETUAL"
-    assert events[0].price == 80737.0
-    assert events[1].timestamp == pytest.approx(1793130317.7)
-
-
-def test_parse_dvol_and_ignore_others():
-    (ev,) = parse_message(DVOL_MSG)
-    assert isinstance(ev, DvolUpdate) and ev.value == 37.36
+def test_parse_messages():
+    trades = parse_message(TRADES_MSG)
+    assert [type(e) for e in trades] == [Trade, Trade]
+    assert trades[0] == Trade(INSTRUMENT, 1793130317626, 80737.0, 10000.0, "456928653")
+    (dvol,) = parse_message(DVOL_MSG)
+    assert isinstance(dvol, DvolUpdate) and dvol.value == 37.36
     assert parse_message({"jsonrpc": "2.0", "id": 1, "result": []}) == []
 
 
-def test_bar_aggregator_ohlc_and_gaps():
-    agg = BarAggregator(10)
-    assert agg.update(100.0, 1.0) == []
-    agg.update(103.0, 3.0)
-    agg.update(105.0, 0.5)
-    agg.update(109.9, 2.0)
-    done = agg.update(135.0, 4.0)  # skips the [120, 130) bucket
-    assert [b.start for b in done] == [100.0, 110.0, 120.0]
-    first = done[0]
-    assert (first.open, first.high, first.low, first.close) == (1.0, 3.0, 0.5, 2.0)
-    assert all(b.open == b.close == 2.0 for b in done[1:])  # flat filler bars
-    assert agg.update(99.0, 100.0) == []  # late trade ignored
+def as_events(df):
+    return [
+        Trade(INSTRUMENT, int(r.timestamp), float(r.price), float(r.amount), str(r.trade_id))
+        for r in df.itertuples()
+    ]
 
 
-def test_bar_aggregator_skips_bars_already_seeded():
-    agg = BarAggregator(60, after=120.0)  # bar [120, 180) is known from history
-    assert agg.update(150.0, 1.0) == []
-    agg.update(185.0, 2.0)
-    (bar,) = agg.update(245.0, 3.0)
-    assert bar.start == 180.0 and bar.open == 2.0
+def tape(hours=3, seed=0, vol=0.5):
+    return simulate_trades(hours * 3600, vol, rate=2.0, seed=seed)
 
 
-def test_streaming_ewma_equals_batch():
-    rng = np.random.default_rng(0)
-    r = rng.normal(0, 0.01, 500)
-    s = StreamingEWMA(0.97, variance=1e-4)
-    for x in r[:-1]:
-        s.update(x)
-    batch = ewma_variance(r, 0.97, init=1e-4)
-    assert s.variance == pytest.approx(batch[-1], rel=1e-12)
+def test_seed_then_live_equals_batch_replay():
+    trades = tape()
+    cut = trades["timestamp"].iloc[0] + 2 * 3600 * 1000 + 4_321  # mid-bar
+    hist = trades[trades["timestamp"] < cut]
+    # The live stream starts a little before the cut: those prints must not count twice.
+    live = trades[trades["timestamp"] >= cut - 3_000]
+
+    m = LiveSpikeMonitor([INSTRUMENT], CONFIG)
+    m.apply_seed({INSTRUMENT: hist})
+    for ev in as_events(live):
+        m.on_event(ev)
+
+    got = m.history(INSTRUMENT)
+    assert got.index.is_unique and got.index.is_monotonic_increasing
+    assert (got.index.to_series().diff().iloc[1:] == pd.Timedelta(seconds=10)).all()  # no gap
+
+    batch = run_detector(log_returns(bar_closes(trades, 10)), CONFIG)
+    batch.index = batch.index + pd.Timedelta(seconds=10)  # live rows are stamped at bar end
+    common = got.index.intersection(batch.index)
+    assert len(common) == len(got) - CONFIG.warmup_bars  # batch output drops the warm-up
+    for col in ("fast_vol", "slow_vol", "ratio"):
+        np.testing.assert_allclose(got.loc[common, col], batch.loc[common, col], rtol=1e-9)
 
 
-def test_half_life():
-    s = StreamingEWMA.from_half_life(10)
-    assert s.lam**10 == pytest.approx(0.5)
+def test_alert_on_volatility_burst():
+    vol = np.r_[np.full(3 * 3600, 0.4), np.full(600, 2.0)]
+    trades = simulate_trades(vol.size, vol, rate=2.0, seed=1)
+    cut = trades["timestamp"].iloc[0] + 3 * 3600 * 1000
+    received = []
+    m = LiveSpikeMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
+    m.apply_seed({INSTRUMENT: trades[trades["timestamp"] < cut]})
+    assert m.snapshot(INSTRUMENT).level == Level.NORMAL
+    for ev in as_events(trades[trades["timestamp"] >= cut]):
+        m.on_event(ev)
+    assert received and received == m.alerts()
+    assert max(a.level for a in received) == Level.SPIKE
+    first = received[0]
+    assert (first.time - pd.Timestamp(cut, unit="ms", tz="UTC")).total_seconds() < 60
+    json.dumps(first.as_dict())
+    snap = m.snapshot(INSTRUMENT)
+    assert snap.fast_vol > snap.slow_vol and snap.sigma_1m > 0
 
 
-def test_monitor_end_to_end_without_network():
-    m = LiveVolMonitor(["BTC-PERPETUAL"], bar_seconds=1.0, window=200, half_life_seconds=30)
-    rng = np.random.default_rng(1)
-    sigma_bar = 1e-3
-    price, t = 100.0, 1_000_000.0
-    for _ in range(600):
-        for k in range(5):
-            m.on_event(Trade("BTC-PERPETUAL", t + 0.2 * k, price, 1.0))
-        price *= math.exp(rng.normal(0, sigma_bar))
-        t += 1.0
-    m.on_event(DvolUpdate("btc_usd", t, 50.0))
-    snap = m.snapshot("BTC-PERPETUAL")
-    true_annual = sigma_bar * math.sqrt(m.periods)
-    assert snap.bars == 200
-    assert snap.dvol == pytest.approx(0.5)
-    assert snap.cc_lower < true_annual < snap.cc_upper
-    assert snap.ewma == pytest.approx(true_annual, rel=0.4)
-    assert len(m.history("BTC-PERPETUAL")) > 500
+def test_bars_close_on_time_without_trades():
+    trades = tape(hours=1)
+    m = LiveSpikeMonitor([INSTRUMENT], DetectorConfig(bar_seconds=10, slow_half_life=300))
+    m.apply_seed({INSTRUMENT: trades})
+    last = m.snapshot(INSTRUMENT).time
+    later = int(last.timestamp() * 1000) + 35_000
+    m.on_event(DvolUpdate("btc_usd", later, 40.0))
+    snap = m.snapshot(INSTRUMENT)
+    assert (snap.time - last).total_seconds() == 30  # three empty bars closed by the clock
+    assert snap.dvol == pytest.approx(0.40)
 
 
-def test_dvol_indices_mapping():
-    m = LiveVolMonitor(["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL_USDC-PERPETUAL"])
+def test_dvol_indices():
+    m = LiveSpikeMonitor(["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL_USDC-PERPETUAL"])
     assert m.dvol_indices == ["btc_usd", "eth_usd"]
 
 
-class _FakeREST:
-    """Serves 1-minute bars ending at the current minute, which is still in progress."""
+class FakeREST:
+    def __init__(self, trades):
+        self.data = trades
+        self.calls = 0
 
-    def __init__(self, now: pd.Timestamp):
-        self.now = now
-
-    def ohlc(self, instrument, resolution, start, end):
-        idx = pd.date_range(end=self.now.floor("min"), periods=300, freq="min")
-        rng = np.random.default_rng(0)
-        close = 100 * np.exp(np.cumsum(rng.normal(0, 1e-3, idx.size)))
-        return pd.DataFrame(
-            {"open": close, "high": close * 1.0005, "low": close * 0.9995, "close": close},
-            index=idx,
-        )
+    def trades(self, instrument, start, end):
+        self.calls += 1
+        return self.data
 
 
-def test_seed_excludes_bar_in_progress_and_live_continues():
-    now = pd.Timestamp.now(tz="UTC")
-    m = LiveVolMonitor(["BTC-PERPETUAL"], bar_seconds=60, window=120)
-    m.seed(_FakeREST(now))
-    st = m._state["BTC-PERPETUAL"]
-    last_seeded = st.bars[-1].start
-    assert last_seeded == (now.floor("min") - pd.Timedelta(minutes=1)).timestamp()
-    # Live trades inside the current minute and the next one: exactly one new bar,
-    # starting right after the last seeded bar, no duplicate timestamps.
-    t0 = now.floor("min").timestamp()
-    m.on_event(Trade("BTC-PERPETUAL", t0 + 5, 100.0, 1.0))
-    m.on_event(Trade("BTC-PERPETUAL", t0 + 65, 100.1, 1.0))
-    starts = [b.start for b in st.bars]
-    assert starts[-1] == t0 and len(starts) == len(set(starts))
+class FakeStream:
+    def __init__(self, events):
+        self._events = events
+
+    async def events(self):
+        for ev in self._events:
+            await asyncio.sleep(0.001)
+            yield ev
+
+
+async def test_run_buffers_during_seed_and_reseeds_after_reconnect():
+    trades = tape(hours=2)
+    cut = trades["timestamp"].iloc[0] + 7000 * 1000
+    rest = FakeREST(trades[trades["timestamp"] < cut])
+    live = as_events(trades[trades["timestamp"] >= cut - 2_000])
+    events = [*live[:300], Reconnected(), *live[300:]]
+    m = LiveSpikeMonitor([INSTRUMENT], CONFIG)
+    await m.run(stream=FakeStream(events), rest=rest)
+    assert rest.calls == 2
+    hist = m.history(INSTRUMENT)
+    assert hist.index.is_unique
+    assert hist.index[-1] >= pd.Timestamp(int(live[-1].timestamp_ms) - 20_000, unit="ms", tz="UTC")

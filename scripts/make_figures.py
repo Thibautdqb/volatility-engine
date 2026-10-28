@@ -1,21 +1,18 @@
-"""Regenerate the figures in docs/img from live data.
+"""Regenerate the figures in docs/img from the Deribit trade tape.
 
-python scripts/make_figures.py
+python scripts/make_figures.py --end 2026-10-28 --days 14
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from matplotlib.ticker import PercentFormatter
 
-from volengine import estimators as est
-from volengine.deribit.rest import DeribitREST
-from volengine.garch import fit_garch
-from volengine.research import DAYS_PER_YEAR, load_daily, variance_risk_premium
+from volengine.detector import Level
+from volengine.study import run_study
 
 OUT = Path(__file__).resolve().parents[1] / "docs" / "img"
 plt.rcParams.update(
@@ -29,43 +26,71 @@ plt.rcParams.update(
         "legend.frameon": False,
     }
 )
+INSTRUMENTS = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
 
 
-def implied_vs_realized(instrument: str = "BTC-PERPETUAL") -> None:
-    data = load_daily(instrument, "2019-01-01")
-    vrp = variance_risk_premium(data).series
-    g = fit_garch(data.returns)
-    cond = np.sqrt(g.conditional_variance * DAYS_PER_YEAR).loc[vrp.index[0] :]
-
-    fig, ax = plt.subplots(figsize=(9, 3.6))
-    ax.plot(vrp.index, vrp["implied"], lw=1, label="DVOL (30d implied, observed at t)")
-    ax.plot(vrp.index, vrp["realized"], lw=1, label="Realized vol over (t, t+30d]")
-    ax.plot(cond.index, cond, lw=0.6, alpha=0.6, color="grey", label="GARCH(1,1) conditional vol")
-    ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
-    ax.set_title(f"{instrument}: implied vs subsequently realized volatility")
-    ax.legend(loc="upper right", ncol=3)
+def after_episodes(studies) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.2), sharey=True)
+    for ax, s in zip(axes, studies, strict=True):
+        p = s.profile
+        ax.fill_between(p.index, p["ci low"], p["ci high"], alpha=0.25, lw=0)
+        ax.plot(p.index, p["after episode start"], marker="o", ms=3, label="after a new alert")
+        ax.plot(p.index, p["any time"], marker="o", ms=3, color="grey", label="at any time")
+        ax.axhline(1, color="black", lw=0.6)
+        ax.set_xscale("log")
+        ax.set_xticks(p.index, [str(m) for m in p.index])
+        ax.set_xlabel("next ... minutes")
+        ax.set_title(f"{s.instrument}, {len(s.episodes)} alerts")
+    axes[0].set_ylabel("realized vol / normal vol (median)")
+    axes[0].legend(loc="upper right")
     fig.tight_layout()
-    fig.savefig(OUT / "implied_vs_realized.png")
+    fig.savefig(OUT / "after_alert.png")
 
 
-def signature(instrument: str = "BTC-PERPETUAL", days: int = 14) -> None:
-    end = pd.Timestamp.now(tz="UTC").floor("min")
-    with DeribitREST() as api:
-        bars = api.ohlc(instrument, "1", end - pd.Timedelta(days=days), end)
-    steps = (1, 2, 3, 5, 10, 15, 30, 60, 120)
-    sig = est.signature_plot(bars["close"], 60, steps=steps)
-    fig, ax = plt.subplots(figsize=(5.5, 3.2))
-    ax.plot(sig.index / 60, sig.to_numpy(), marker="o", ms=3)
-    ax.set_xscale("log")
-    ax.set_xticks([1, 5, 15, 60, 120], labels=["1m", "5m", "15m", "1h", "2h"])
-    ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
-    ax.set_xlabel("sampling interval")
-    ax.set_title(f"{instrument}: volatility signature, last {days} days")
+def example(study, hours: float = 1.5) -> None:
+    sig = study.signals
+    t0 = sig.index[(sig["alert"] & (sig["level"] == Level.SPIKE)).to_numpy()]
+    # The spike alert with the largest ratio, shown with the hour before it.
+    peak = sig.loc[t0, "ratio"].idxmax()
+    win = sig.loc[peak - pd.Timedelta(hours=hours) : peak + pd.Timedelta(minutes=30)]
+    price = win["return"].cumsum()
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 4.2), sharex=True, height_ratios=[1, 1])
+    a1.plot(win.index, 100 * price, lw=0.8)
+    a1.set_ylabel("price change (%)")
+    a2.plot(win.index, win["ratio"], lw=0.8)
+    c = study.config
+    for y, name in [(c.elevated, "elevated"), (c.spike, "spike")]:
+        a2.axhline(y, ls=":", lw=0.8, color="black")
+        a2.text(win.index[0], y, f" {name}", va="bottom", fontsize=8)
+    a2.set_ylabel("vol 1m / normal")
+    run = (win["level"] != win["level"].shift()).cumsum()
+    for _, seg in win.groupby(run):
+        lv = int(seg["level"].iloc[0])
+        if lv:
+            for ax in (a1, a2):
+                ax.axvspan(
+                    seg.index[0],
+                    seg.index[-1],
+                    color="tab:orange" if lv == 1 else "tab:red",
+                    alpha=0.15 if lv == 1 else 0.25,
+                    lw=0,
+                )
+    a1.set_title(f"{study.instrument}, {peak:%Y-%m-%d} (UTC); orange = elevated, red = spike")
+    fig.autofmt_xdate()
     fig.tight_layout()
-    fig.savefig(OUT / "signature.png")
+    fig.savefig(OUT / "example.png")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--end", default="2026-10-28")
+    p.add_argument("--days", type=int, default=14)
+    args = p.parse_args()
+    OUT.mkdir(parents=True, exist_ok=True)
+    studies = [run_study(i, days=args.days, end=args.end) for i in INSTRUMENTS]
+    after_episodes(studies)
+    example(studies[0])
 
 
 if __name__ == "__main__":
-    OUT.mkdir(parents=True, exist_ok=True)
-    implied_vs_realized()
-    signature()
+    main()
