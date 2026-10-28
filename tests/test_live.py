@@ -8,8 +8,9 @@ import pytest
 from tests.conftest import simulate_trades
 from volengine.deribit.stream import DvolUpdate, Reconnected, Trade, parse_message
 from volengine.detector import DetectorConfig, Level, run_detector
-from volengine.live import LiveSpikeMonitor
-from volengine.sampling import bar_closes, log_returns
+from volengine.forecast import Regime, har_inputs, prepare
+from volengine.live import LiveMonitor
+from volengine.sampling import bar_closes, bar_counts, log_returns
 
 TRADES_MSG = {
     "jsonrpc": "2.0",
@@ -79,7 +80,7 @@ def test_seed_then_live_equals_batch_replay():
     # The live stream starts a little before the cut: those prints must not count twice.
     live = trades[trades["timestamp"] >= cut - 3_000]
 
-    m = LiveSpikeMonitor([INSTRUMENT], CONFIG)
+    m = LiveMonitor([INSTRUMENT], CONFIG)
     m.apply_seed({INSTRUMENT: hist})
     for ev in as_events(live):
         m.on_event(ev)
@@ -91,9 +92,18 @@ def test_seed_then_live_equals_batch_replay():
     batch = run_detector(log_returns(bar_closes(trades, 10)), CONFIG)
     batch.index = batch.index + pd.Timedelta(seconds=10)  # live rows are stamped at bar end
     common = got.index.intersection(batch.index)
-    assert len(common) == len(got) - CONFIG.warmup_bars  # batch output drops the warm-up
+    assert len(common) == len(got)  # both drop the warm-up
     for col in ("fast_vol", "slow_vol", "ratio"):
         np.testing.assert_allclose(got.loc[common, col], batch.loc[common, col], rtol=1e-9)
+
+    # The streaming forecast equals the batch features run through the same model.
+    closes = bar_closes(trades, 10)
+    feats = prepare(log_returns(closes), bar_counts(trades, closes, 10), CONFIG)
+    feats.index = feats.index + pd.Timedelta(seconds=10)
+    model = m.models[INSTRUMENT]
+    expected = np.exp(model.predict(har_inputs(feats, model))) * feats["slow_vol"]
+    expected = expected.loc[common].iloc[200:]  # after the 30-minute look-back fills
+    np.testing.assert_allclose(got.loc[expected.index, "forecast_vol"], expected, rtol=1e-9)
 
 
 def test_alert_on_volatility_burst():
@@ -101,23 +111,26 @@ def test_alert_on_volatility_burst():
     trades = simulate_trades(vol.size, vol, rate=2.0, seed=1)
     cut = trades["timestamp"].iloc[0] + 3 * 3600 * 1000
     received = []
-    m = LiveSpikeMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
+    m = LiveMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
     m.apply_seed({INSTRUMENT: trades[trades["timestamp"] < cut]})
     assert m.snapshot(INSTRUMENT).level == Level.NORMAL
     for ev in as_events(trades[trades["timestamp"] >= cut]):
         m.on_event(ev)
     assert received and received == m.alerts()
-    assert max(a.level for a in received) == Level.SPIKE
-    first = received[0]
+    spikes = [a for a in received if a.kind == "spike"]
+    assert spikes[-1].level == "spike" or any(a.level == "spike" for a in spikes)
+    assert any(a.kind == "regime" and a.level == "stressed" for a in received)
+    first = spikes[0]
     assert (first.time - pd.Timestamp(cut, unit="ms", tz="UTC")).total_seconds() < 60
     json.dumps(first.as_dict())
     snap = m.snapshot(INSTRUMENT)
-    assert snap.fast_vol > snap.slow_vol and snap.sigma_1m > 0
+    assert snap.fast_vol > snap.slow_vol and snap.sigma_5m > 0
+    assert snap.regime >= Regime.ACTIVE
 
 
 def test_bars_close_on_time_without_trades():
     trades = tape(hours=1)
-    m = LiveSpikeMonitor([INSTRUMENT], DetectorConfig(bar_seconds=10, slow_half_life=300))
+    m = LiveMonitor([INSTRUMENT], DetectorConfig(bar_seconds=10, slow_half_life=300))
     m.apply_seed({INSTRUMENT: trades})
     last = m.snapshot(INSTRUMENT).time
     later = int(last.timestamp() * 1000) + 35_000
@@ -128,7 +141,7 @@ def test_bars_close_on_time_without_trades():
 
 
 def test_dvol_indices():
-    m = LiveSpikeMonitor(["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL_USDC-PERPETUAL"])
+    m = LiveMonitor(["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL_USDC-PERPETUAL"])
     assert m.dvol_indices == ["btc_usd", "eth_usd"]
 
 
@@ -158,7 +171,7 @@ async def test_run_buffers_during_seed_and_reseeds_after_reconnect():
     rest = FakeREST(trades[trades["timestamp"] < cut])
     live = as_events(trades[trades["timestamp"] >= cut - 2_000])
     events = [*live[:300], Reconnected(), *live[300:]]
-    m = LiveSpikeMonitor([INSTRUMENT], CONFIG)
+    m = LiveMonitor([INSTRUMENT], CONFIG)
     await m.run(stream=FakeStream(events), rest=rest)
     assert rest.calls == 2
     hist = m.history(INSTRUMENT)
@@ -170,7 +183,7 @@ def test_alerts_found_in_startup_history_are_listed_but_not_sent():
     vol = np.r_[np.full(3 * 3600, 0.4), np.full(300, 2.0), np.full(1200, 0.4)]
     trades = simulate_trades(vol.size, vol, rate=2.0, seed=5)
     received = []
-    m = LiveSpikeMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
+    m = LiveMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
     m.apply_seed({INSTRUMENT: trades})
     alerts = m.alerts()
     assert alerts and not received

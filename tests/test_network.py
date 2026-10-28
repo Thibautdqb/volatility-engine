@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from volengine.deribit import DeribitREST, DeribitStream, Trade
-from volengine.live import LiveSpikeMonitor
+from volengine.live import LiveMonitor
 
 pytestmark = pytest.mark.network
 
@@ -37,7 +37,7 @@ async def test_stream_delivers_trades():
 
 
 async def test_monitor_seeds_and_runs_live():
-    m = LiveSpikeMonitor(["BTC-PERPETUAL"])
+    m = LiveMonitor(["BTC-PERPETUAL"])
     task = asyncio.ensure_future(m.run())
     try:
         for _ in range(120):

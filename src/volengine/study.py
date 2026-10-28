@@ -1,4 +1,4 @@
-"""Historical evaluation of the spike detector on the Deribit trade tape.
+"""Historical evaluation on the Deribit trade tape: spike detector and 5-minute forecast.
 
 The detector is replayed bar by bar over past trades, exactly as it runs live, and
 two questions are answered:
@@ -30,7 +30,17 @@ import pandas as pd
 
 from volengine.deribit.rest import TRADE_COLUMNS, DeribitREST
 from volengine.detector import DetectorConfig, Level, run_detector
-from volengine.sampling import bar_closes, log_returns
+from volengine.forecast import (
+    FEATURES,
+    HARModel,
+    Regime,
+    fit,
+    har_inputs,
+    prepare,
+    sample_windows,
+    track_regimes,
+)
+from volengine.sampling import bar_closes, bar_counts, log_returns
 from volengine.stats import bootstrap_ci
 
 log = logging.getLogger(__name__)
@@ -59,7 +69,7 @@ def load_trades(
     """Trades for the UTC days in [start, end), downloaded once and cached per day."""
     start, end = _utc(start).floor("D"), _utc(end).floor("D")
     days = pd.date_range(start, end, freq="D", inclusive="left")
-    folder = Path(cache_dir) / "trades" / instrument
+    folder = Path(cache_dir) / "trades-v2" / instrument
     folder.mkdir(parents=True, exist_ok=True)
     now = pd.Timestamp.now(tz="UTC")
 
@@ -68,10 +78,14 @@ def load_trades(
         def one(day: pd.Timestamp) -> pd.DataFrame:
             path = folder / f"{day:%Y-%m-%d}.csv.gz"
             if path.exists():
-                return pd.read_csv(path, dtype={"trade_id": str})
+                return pd.read_csv(
+                    path, dtype={"trade_id": str, "liquidation": str}, keep_default_na=False
+                )
             df = api.trades(instrument, day, day + pd.Timedelta(days=1))
             if day + pd.Timedelta(days=1) <= now:  # only complete days are cached
-                df.to_csv(path, index=False)
+                tmp = path.with_suffix(".tmp")
+                df.to_csv(tmp, index=False, compression="gzip")
+                tmp.replace(path)  # atomic: an interrupted run never leaves a truncated file
             log.info("%s %s: %d trades", instrument, day.date(), len(df))
             return df
 
@@ -279,3 +293,146 @@ def run_study(
     if trades.empty:
         raise RuntimeError(f"no trades for {instrument}")
     return analyze(trades, instrument, config, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# five-minute forecast and regimes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ForecastStudy:
+    instrument: str
+    model: HARModel
+    test_span: str
+    n_test: int
+    scores: pd.DataFrame
+    gain_ci: tuple[float, float]
+    mz_slope: float
+    regimes: pd.DataFrame
+    violent: float
+
+    def summary(self) -> str:
+        m = self.model
+        coefs = "  ".join(f"{f} {c:+.3f}" for f, c in zip(FEATURES, m.coefs, strict=True))
+        lines = [
+            f"{self.instrument}  fitted on {m.trained_on} ({m.n} windows), "
+            f"tested on {self.test_span} ({self.n_test} windows)",
+            f"  log(vol next 5m / normal) = {m.intercept:+.3f}  {coefs}",
+            "  regime cut points on the forecast ratio: " + " / ".join(f"{c:.2f}" for c in m.cuts),
+            "",
+            "out-of-sample accuracy of log(vol next 5m / normal):",
+            self.scores.to_string(float_format=lambda x: f"{x:.3f}"),
+            f"MSE reduction vs 'last 5 minutes': 95% CI [{self.gain_ci[0]:.4f}, "
+            f"{self.gain_ci[1]:.4f}]   Mincer-Zarnowitz slope {self.mz_slope:.2f}",
+            "",
+            f"regimes (violent = next 5m vol >= {self.violent:g}x normal):",
+            self.regimes.to_string(float_format=lambda x: f"{x:.3f}"),
+        ]
+        return "\n".join(lines)
+
+
+def prepare_trades(trades: pd.DataFrame, config: DetectorConfig) -> pd.DataFrame:
+    closes = bar_closes(trades, config.bar_seconds)
+    return prepare(log_returns(closes), bar_counts(trades, closes, config.bar_seconds), config)
+
+
+def forecast_study(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    instrument: str,
+    config: DetectorConfig | None = None,
+    violent: float = 2.0,
+    n_boot: int = 2000,
+) -> ForecastStudy:
+    """Fit the HAR forecast on ``train`` trades and score it on later ``test`` trades."""
+    config = config or DetectorConfig()
+    model = fit(prepare_trades(train, config), config, instrument)
+    bars = prepare_trades(test, config)
+    # The regime is tracked bar by bar, exactly as live, then read at each window start.
+    bars["regime"] = track_regimes(np.exp(model.predict(har_inputs(bars, model))), model.cuts)
+    te = sample_windows(bars, model.season, config)
+    y = te["y"].to_numpy()
+    candidates = {
+        "normal level (no change)": np.zeros(len(te)),
+        "last 5 minutes": te["x5"].to_numpy(),
+        "spike detector (vol 1m)": np.log(te["ratio"].to_numpy()),
+        "forecast": model.predict(har_inputs(te, model)),
+    }
+    sst = np.sum((y - y.mean()) ** 2)
+    scores = pd.DataFrame(
+        {
+            "R2": [1 - np.sum((y - f) ** 2) / sst for f in candidates.values()],
+            "MSE": [np.mean((y - f) ** 2) for f in candidates.values()],
+        },
+        index=pd.Index(list(candidates), name="forecast"),
+    )
+    pred = candidates["forecast"]
+    gain = (y - candidates["last 5 minutes"]) ** 2 - (y - pred) ** 2
+    gain_ci = bootstrap_ci(gain, n_boot=n_boot, block_size=12)
+    slope = float(np.polyfit(pred, y, 1)[0])
+
+    regime = te["regime"].to_numpy()
+    hit = (y >= np.log(violent)).astype(float)
+    rows = []
+    for rg in Regime:
+        m = (regime == rg).astype(float)
+        ci = bootstrap_ci(
+            np.column_stack([m, hit]),
+            lambda d: _share(d[:, 0], d[:, 1]),
+            n_boot=n_boot,
+            block_size=12,
+        )
+        sel = m.astype(bool)
+        rows.append(
+            {
+                "regime": rg.name.lower(),
+                "share": sel.mean(),
+                "realized ratio (median)": float(np.exp(np.median(y[sel])))
+                if sel.any()
+                else np.nan,
+                "P(violent)": _share(m, hit),
+                "ci low": ci[0],
+                "ci high": ci[1],
+                "spike detector off": float((te["level"].to_numpy()[sel] == 0).mean())
+                if sel.any()
+                else np.nan,
+            }
+        )
+    span = f"{te.index[0]:%Y-%m-%d} to {te.index[-1]:%Y-%m-%d}"
+    return ForecastStudy(
+        instrument=instrument,
+        model=model,
+        test_span=span,
+        n_test=len(te),
+        scores=scores,
+        gain_ci=gain_ci,
+        mz_slope=slope,
+        regimes=pd.DataFrame(rows).set_index("regime"),
+        violent=violent,
+    )
+
+
+def run_forecast_study(
+    instrument: str,
+    train_days: int = 30,
+    test_days: int = 14,
+    end: pd.Timestamp | None = None,
+    config: DetectorConfig | None = None,
+    **kwargs,
+) -> ForecastStudy:
+    """Train on ``train_days`` complete UTC days, test on the ``test_days`` that follow."""
+    end = (_utc(end) if end is not None else pd.Timestamp.now(tz="UTC")).floor("D")
+    split = end - pd.Timedelta(days=test_days)
+    train = load_trades(instrument, split - pd.Timedelta(days=train_days), split)
+    test = load_trades(instrument, split, end)
+    return forecast_study(train, test, instrument, config, **kwargs)
+
+
+def fit_model(
+    instrument: str, days: int = 44, end: pd.Timestamp | None = None, config=None
+) -> HARModel:
+    end = (_utc(end) if end is not None else pd.Timestamp.now(tz="UTC")).floor("D")
+    trades = load_trades(instrument, end - pd.Timedelta(days=days), end)
+    config = config or DetectorConfig()
+    return fit(prepare_trades(trades, config), config, instrument)

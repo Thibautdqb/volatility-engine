@@ -1,4 +1,4 @@
-"""Streamlit front-end for the live spike monitor.
+"""Streamlit front-end for the live monitor.
 
 streamlit run dashboard/app.py
 """
@@ -11,13 +11,20 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from volengine.detector import DetectorConfig, Level
-from volengine.live import LiveSpikeMonitor
+from volengine.forecast import Regime
+from volengine.live import LiveMonitor
 
 st.set_page_config(page_title="volengine", layout="wide")
 
 INSTRUMENTS = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
-LEVEL_COLOR = {Level.NORMAL: "#2e7d32", Level.ELEVATED: "#ef6c00", Level.SPIKE: "#c62828"}
-LEVEL_FILL = {Level.ELEVATED: "rgba(239,108,0,0.12)", Level.SPIKE: "rgba(198,40,40,0.18)"}
+REGIME_COLOR = {
+    Regime.CALM: "#1565c0",
+    Regime.NORMAL: "#2e7d32",
+    Regime.ACTIVE: "#ef6c00",
+    Regime.STRESSED: "#c62828",
+}
+REGIME_FILL = {Regime.ACTIVE: "rgba(239,108,0,0.10)", Regime.STRESSED: "rgba(198,40,40,0.18)"}
+LEVEL_COLOR = {Level.NORMAL: "#757575", Level.ELEVATED: "#ef6c00", Level.SPIKE: "#c62828"}
 
 
 def duration(td: pd.Timedelta) -> str:
@@ -33,132 +40,159 @@ def bp(x) -> str:
     return "n/a" if x is None or pd.isna(x) else f"{1e4 * x:+.1f} bp"
 
 
-def pct(x, d=1, sign=False):
-    return "n/a" if x is None or pd.isna(x) else f"{100 * x:{'+' if sign else ''}.{d}f}%"
+def pct(x, d=1):
+    return "n/a" if x is None or pd.isna(x) else f"{100 * x:.{d}f}%"
+
+
+def badge(text: str, color: str) -> str:
+    return (
+        f"<span style='background:{color};color:white;padding:2px 10px;border-radius:4px;"
+        f"font-size:0.8em'>{text}</span>"
+    )
 
 
 @st.cache_resource(show_spinner=False)
-def get_monitor(instruments: tuple[str, ...], config: DetectorConfig) -> LiveSpikeMonitor:
-    monitor = LiveSpikeMonitor(instruments, config)
+def get_monitor(instruments: tuple[str, ...], config: DetectorConfig) -> LiveMonitor:
+    monitor = LiveMonitor(instruments, config)
     monitor.start_background()
     return monitor
 
 
-def level_spans(levels: pd.Series):
-    """Contiguous runs of elevated or spike bars, as (start, end, level)."""
-    if levels.empty:
-        return
-    run_id = (levels != levels.shift()).cumsum()
-    for _, run in levels.groupby(run_id):
-        lv = Level(int(run.iloc[0]))
-        if lv != Level.NORMAL:
-            yield run.index[0], run.index[-1], lv
+def regime_spans(regimes: pd.Series):
+    """Contiguous runs of ACTIVE or STRESSED forecasts, as (start, end, regime)."""
+    run_id = (regimes != regimes.shift()).cumsum()
+    for _, run in regimes.groupby(run_id):
+        rg = int(run.iloc[0])
+        if rg in (Regime.ACTIVE, Regime.STRESSED):
+            yield run.index[0], run.index[-1], Regime(rg)
 
 
-def chart(h: pd.DataFrame, config: DetectorConfig, title: str) -> go.Figure:
+def chart(h: pd.DataFrame) -> go.Figure:
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, row_heights=[0.55, 0.45], vertical_spacing=0.04
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.04
     )
     fig.add_trace(go.Scatter(x=h.index, y=h["price"], name="price", line=dict(width=1)), 1, 1)
+    vols = [
+        ("forecast_vol", "forecast, next 5m", dict(width=2)),
+        ("fast_vol", "realized, last 1m", dict(width=1, dash="dot")),
+        ("slow_vol", "normal (30m)", dict(width=1, color="grey")),
+    ]
+    for col, name, line in vols:
+        fig.add_trace(go.Scatter(x=h.index, y=h[col], name=name, line=line), 2, 1)
+    for x0, x1, rg in regime_spans(h["regime"]):
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=REGIME_FILL[rg], line_width=0)
+    spikes = h[h["level"] == Level.SPIKE]
     fig.add_trace(
-        go.Scatter(x=h.index, y=h["ratio"], name="vol 1m / normal", line=dict(width=1)), 2, 1
+        go.Scatter(
+            x=spikes.index,
+            y=spikes["price"],
+            mode="markers",
+            name="spike",
+            marker=dict(color="#c62828", size=5),
+        ),
+        1,
+        1,
     )
-    for y, name in [(config.elevated, "elevated"), (config.spike, "spike")]:
-        fig.add_hline(y=y, line=dict(dash="dot", width=1), row=2, col=1, annotation_text=name)
-    for x0, x1, lv in level_spans(h["level"]):
-        fig.add_vrect(x0=x0, x1=x1, fillcolor=LEVEL_FILL[lv], line_width=0)
     fig.update_yaxes(title_text="price", row=1, col=1)
-    fig.update_yaxes(title_text="ratio", row=2, col=1)
+    fig.update_yaxes(title_text="annualized vol", tickformat=".0%", row=2, col=1)
     fig.update_layout(
-        title=title,
         template="plotly_white",
-        height=460,
-        margin=dict(l=10, r=10, t=40, b=10),
-        showlegend=False,
+        height=480,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", y=-0.08),
     )
     return fig
 
 
 with st.sidebar:
     instruments = st.multiselect("Instruments", INSTRUMENTS, default=INSTRUMENTS)
-    d = DetectorConfig()
-    bar = st.select_slider("Bar (s)", [5.0, 10.0, 15.0, 30.0], value=d.bar_seconds)
-    elevated = st.number_input("Elevated at ratio", 1.2, 10.0, d.elevated, 0.1)
-    spike = st.number_input("Spike at ratio", 1.5, 20.0, d.spike, 0.1)
-    reset = st.number_input("Reset below ratio", 1.0, 5.0, d.reset, 0.1)
     hours = st.slider("Chart window (h)", 0.5, 6.0, 2.0, 0.5)
 
-st.title("Volatility spike monitor")
+st.title("Short-term volatility monitor")
 st.caption(
-    f"Deribit perpetuals, {bar:g}-second bars. **Ratio** = volatility over the last minute "
-    "(EWMA, half-life 1 min) / normal volatility (EWMA, half-life 30 min). "
-    f"ELEVATED at {elevated:g}x, SPIKE at {spike:g}x, back to NORMAL below {reset:g}x."
+    "Deribit perpetuals, 10-second bars, updated live over WebSocket. **Regime** = forecast of "
+    "the volatility over the next 5 minutes (intraday HAR), ranked against the training "
+    "period: CALM (lowest 25%), NORMAL, ACTIVE, STRESSED (top 5%). **Spike** = volatility over "
+    "the last minute vs the 30-minute normal: elevated at 2x, spike at 3x."
 )
 
 if not instruments:
     st.info("Select at least one instrument.")
     st.stop()
-try:
-    config = DetectorConfig(bar_seconds=bar, elevated=elevated, spike=spike, reset=reset)
-except ValueError as exc:
-    st.error(str(exc))
-    st.stop()
-monitor = get_monitor(tuple(instruments), config)
+monitor = get_monitor(tuple(instruments), DetectorConfig())
 
 
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def render() -> None:
     snaps = {s.instrument: s for s in monitor.snapshots()}
     if not snaps:
-        st.info("Loading the last three hours of trades from Deribit to warm up the detector...")
+        st.info("Loading the last four hours of trades from Deribit to warm up the models...")
         return
     for inst in instruments:
         s = snaps.get(inst)
         if s is None:
             st.caption(f"{inst}: warming up")
             continue
-        badge = LEVEL_COLOR[s.level]
         st.markdown(
-            f"### {inst} &nbsp; <span style='background:{badge};color:white;padding:2px 10px;"
-            f"border-radius:4px;font-size:0.8em'>{s.level.name}</span> "
-            f"<span style='font-size:0.7em;color:gray'>for {duration(s.time - s.level_since)} "
-            f"· {s.time:%H:%M:%S} UTC</span>",
+            f"### {inst} &nbsp; {badge(s.regime.name, REGIME_COLOR[s.regime])} "
+            f"<span style='font-size:0.7em;color:gray'>for {duration(s.time - s.regime_since)}"
+            f"</span> &nbsp; {badge('spike: ' + s.level.name, LEVEL_COLOR[s.level])} "
+            f"<span style='font-size:0.7em;color:gray'>· {s.time:%H:%M:%S} UTC</span>",
             unsafe_allow_html=True,
         )
-        c = st.columns(7)
+        c = st.columns(6)
         c[0].metric("Price", price(s.price), bp(s.move_1m), help="change over the last minute")
-        c[1].metric("Vol ratio", f"{s.ratio:.2f}x", help="vol over the last minute / normal")
-        c[2].metric("Vol 1m", pct(s.fast_vol), help="EWMA, half-life 1 minute, annualized")
-        c[3].metric("Normal vol", pct(s.slow_vol), help="EWMA, half-life 30 minutes")
-        c[4].metric(
-            "1 sd move / 1m", f"±{price(s.sigma_1m)}", help="one standard deviation, at vol 1m"
+        c[1].metric(
+            "Next 5m vol",
+            pct(s.forecast_vol),
+            f"{s.forecast_ratio:.2f}x normal",
+            delta_color="off",
+            help="HAR forecast, annualized",
         )
-        c[5].metric("Trade rate", f"{s.activity:.1f}x", help="trades per bar vs normal")
-        c[6].metric("DVOL", pct(s.dvol), help="Deribit 30-day implied vol index")
+        c[2].metric(
+            "1 sd move, 5m", f"±{price(s.sigma_5m)}", help="one standard deviation, forecast"
+        )
+        c[3].metric(
+            "Vol 1m", pct(s.fast_vol), f"{s.ratio:.2f}x normal", delta_color="off", help="EWMA"
+        )
+        c[4].metric("Normal vol", pct(s.slow_vol), help="EWMA, half-life 30 minutes")
+        c[5].metric("DVOL", pct(s.dvol), help="Deribit 30-day implied vol index")
         h = monitor.history(inst)
-        h = h[h.index >= h.index[-1] - pd.Timedelta(hours=hours)]
-        st.plotly_chart(chart(h, config, ""), width="stretch", key=f"chart-{inst}")
+        h = h[(h.index >= h.index[-1] - pd.Timedelta(hours=hours)) & (h["regime"] >= 0)]
+        st.plotly_chart(chart(h), width="stretch", key=f"chart-{inst}")
 
     alerts = monitor.alerts()
     st.subheader("Alerts")
+    st.caption(
+        "regime = the forecast enters STRESSED · spike = the detector escalates · "
+        "history = found in the trades loaded at start-up, before the live feed"
+    )
     if not alerts:
         st.caption("No alert since start.")
         return
-    st.caption("history = found in the trades loaded at start-up, before the live feed")
     table = pd.DataFrame([a.as_dict() for a in reversed(alerts)])
     table["source"] = table.pop("live").map({True: "live", False: "history"})
-    table["level"] = table["previous"] + " → " + table["level"]
-    table = table.drop(columns="previous")
+    table["change"] = table.pop("previous") + " → " + table.pop("level")
     table["time"] = pd.to_datetime(table["time"]).dt.strftime("%H:%M:%S")
-    for col in ("fast_vol", "slow_vol", "dvol"):
+    for col in ("forecast_vol", "fast_vol", "slow_vol", "dvol"):
         table[col] = table[col].map(pct)
+    for col in ("forecast_ratio", "ratio"):
+        table[col] = table[col].map("{:.2f}x".format)
     table["move_1m"] = table["move_1m"].map(bp)
-    table["ratio"] = table["ratio"].map("{:.2f}x".format)
     table["price"] = table["price"].map(price)
     table = table.rename(
-        columns={"fast_vol": "vol 1m", "slow_vol": "normal vol", "move_1m": "move 1m"}
+        columns={
+            "forecast_vol": "next 5m vol",
+            "forecast_ratio": "next 5m / normal",
+            "fast_vol": "vol 1m",
+            "ratio": "1m / normal",
+            "slow_vol": "normal vol",
+            "move_1m": "move 1m",
+        }
     )
-    st.dataframe(table, hide_index=True, width="stretch")
+    cols = ["time", "instrument", "kind", "change", "next 5m vol", "next 5m / normal"]
+    rest = [c for c in table.columns if c not in cols]
+    st.dataframe(table[cols + rest], hide_index=True, width="stretch")
 
 
 render()

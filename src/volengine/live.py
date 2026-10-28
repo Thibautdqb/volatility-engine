@@ -1,10 +1,11 @@
-"""Live spike monitor on Deribit perpetuals.
+"""Live monitor on Deribit perpetuals: five-minute volatility forecast and regime, plus
+the spike detector.
 
 Start-up sequence, also replayed after every reconnection:
 
 1. subscribe to the trade stream and buffer what arrives;
-2. download the last two hours of trades from the history server and run the
-   detector over them, so the slow (normal) volatility is warm from the first bar;
+2. download the last four hours of trades from the history server and run the
+   models over them, so the normal volatility and the forecast are warm from the start;
 3. replay the buffered trades that the download did not contain, then go live.
 
 Bars close on exchange time: any message (a trade or a DVOL update, roughly once per
@@ -28,6 +29,14 @@ import pandas as pd
 from volengine.deribit.rest import DeribitREST
 from volengine.deribit.stream import DeribitStream, DvolUpdate, Event, Reconnected, Trade
 from volengine.detector import SECONDS_PER_YEAR, DetectorConfig, Level, SpikeDetector
+from volengine.forecast import (
+    HORIZON_SECONDS,
+    Forecast,
+    HARModel,
+    Regime,
+    StreamingHAR,
+    default_model,
+)
 from volengine.sampling import GridSampler, bar_closes
 
 log = logging.getLogger(__name__)
@@ -43,24 +52,31 @@ class Snapshot:
 
     instrument: str
     time: pd.Timestamp  # end of the last completed bar
-    price: float
-    level: Level
-    level_since: pd.Timestamp
-    ratio: float  # fast / slow volatility
+    price: float  # last trade, updated on every print
+    regime: Regime  # forecast for the next 5 minutes
+    regime_since: pd.Timestamp
+    forecast_ratio: float  # forecast vol over the next 5 minutes / normal vol
+    forecast_vol: float  # the same, annualized
+    sigma_5m: float  # one-standard-deviation price move over the next 5 minutes
+    level: Level  # spike detector: what is happening right now
+    ratio: float  # vol over the last minute / normal vol
     fast_vol: float  # annualized, last ~minute
-    slow_vol: float  # annualized, last ~30 minutes
+    slow_vol: float  # annualized, last ~30 minutes ("normal")
     move_1m: float  # log return over the last minute
-    sigma_1m: float  # one-standard-deviation price move over one minute at the current vol
-    activity: float  # trade rate, fast / slow
     dvol: float | None  # 30-day implied volatility
 
 
 @dataclass(frozen=True)
 class Alert:
+    """``kind`` is "regime" (forecast enters STRESSED) or "spike" (detector escalates)."""
+
     time: pd.Timestamp
     instrument: str
-    level: Level
-    previous: Level
+    kind: str
+    previous: str
+    level: str
+    forecast_ratio: float
+    forecast_vol: float
     ratio: float
     fast_vol: float
     slow_vol: float
@@ -72,88 +88,135 @@ class Alert:
     def as_dict(self) -> dict:
         d = {k: round(v, 6) if isinstance(v, float) else v for k, v in asdict(self).items()}
         d["time"] = self.time.isoformat()
-        d["level"], d["previous"] = self.level.name.lower(), self.previous.name.lower()
         return d
 
 
-class _Rate:
-    """Fast and slow EWMA of the number of trades per bar."""
-
-    def __init__(self, config: DetectorConfig, init: float):
-        self.lf, self.ls = config.lam_fast, config.lam_slow
-        self.fast = self.slow = init
-
-    def update(self, n: int) -> None:
-        self.fast = self.lf * self.fast + (1 - self.lf) * n
-        self.slow = self.ls * self.slow + (1 - self.ls) * n
-
-    @property
-    def ratio(self) -> float:
-        return self.fast / self.slow if self.slow > 0 else float("nan")
-
-
 class _InstrumentState:
-    def __init__(self, config: DetectorConfig):
+    def __init__(self, config: DetectorConfig, model: HARModel):
         self.config = config
         self.sampler = GridSampler(config.bar_seconds)
         self.detector: SpikeDetector | None = None
-        self.rate: _Rate | None = None
+        self.har = StreamingHAR(model, config)
+        self.forecast: Forecast | None = None
         per_minute = max(1, round(60 / config.bar_seconds))
-        self.closes: deque[float] = deque(maxlen=per_minute + 1)
+        self.closes: deque[float] = deque(maxlen=per_minute + 1)  # bars received
+        self.minute: deque[float] = deque(maxlen=per_minute + 1)  # bars through the models
         self.history: deque[tuple] = deque(maxlen=HISTORY_BARS)
         self.level_since: float | None = None
+        self.regime_since: float | None = None
+        self.regime_armed = True  # a regime alert re-arms once back to NORMAL or CALM
         self.last_bar_ms: int | None = None
         self.seed_end: tuple[int, set[str]] | None = None  # last downloaded trade
-        self.warm: list[tuple[int, float, float, int]] = []  # bars seen before the detector starts
+        self.warm: list[tuple] = []  # bars seen before the detector starts
 
-    def add_bar(self, start_ms: int, close: float, n_trades: int) -> tuple[Level, Level] | None:
-        """Feed one completed bar; returns (previous, new) level when it escalated."""
+    def add_bar(self, start_ms: int, close: float, n_trades: int) -> list[dict]:
+        """Feed one completed bar; returns the alerts it raised (see ``_step``)."""
         prev_close = self.closes[-1] if self.closes else None
         self.closes.append(close)
         self.last_bar_ms = start_ms
         if prev_close is None:
-            return None
+            return []
         r = math.log(close / prev_close)
         if self.detector is not None:
             return self._step(start_ms, close, r, n_trades)
         # Same start-up as run_detector: initialize on the warm-up sample, then replay it.
         self.warm.append((start_ms, close, r, n_trades))
         if len(self.warm) < self.config.warmup_bars:
-            return None
+            return []
         var = float(np.mean([w[2] ** 2 for w in self.warm]))
         self.detector = SpikeDetector(self.config, variance=max(var, 1e-12))
-        self.rate = _Rate(self.config, max(float(np.mean([w[3] for w in self.warm])), 1e-6))
+        # The warm-up only initializes the models: like run_detector, it is not reported.
         for w in self.warm:
-            self._step(*w)
+            self._step(*w, report=False)
         self.warm = []
-        return None
+        return []
 
-    def _step(self, start_ms: int, close: float, r: float, n_trades: int):
+    def _step(
+        self, start_ms: int, close: float, r: float, n_trades: int, report: bool = True
+    ) -> list[dict]:
+        """Update the models with one bar. Alerts carry the values at that bar."""
+        changes = []
+        end_s = (start_ms + self.sampler.step) / 1000.0
+        self.minute.append(close)
         before = self.detector.level
         rd = self.detector.update(r)
-        self.rate.update(n_trades)
-        end_ms = start_ms + self.sampler.step
         if rd.level != before or self.level_since is None:
-            self.level_since = end_ms / 1000.0
+            self.level_since = end_s
+        if rd.escalated:
+            changes.append(("spike", before.name.lower(), rd.level.name.lower()))
+
+        self.har.update(r, n_trades)
+        old = self.forecast.regime if self.forecast is not None else None
+        self.forecast = self.har.forecast(rd.slow_var, end_s)
+        if self.forecast is not None:
+            new = self.forecast.regime
+            if new != old or self.regime_since is None:
+                self.regime_since = end_s
+            if new <= Regime.NORMAL:
+                self.regime_armed = True
+            elif new == Regime.STRESSED and self.regime_armed and old is not None:
+                changes.append(("regime", old.name.lower(), new.name.lower()))
+                self.regime_armed = False
+        if not report:
+            return []
+
         ppy = self.config.bars_per_year
+        fc = self.forecast
         fast, slow = math.sqrt(rd.fast_var * ppy), math.sqrt(rd.slow_var * ppy)
-        self.history.append((end_ms, close, fast, slow, rd.ratio, int(rd.level)))
-        return (before, rd.level) if rd.escalated else None
+        self.history.append(
+            (
+                int(end_s * 1000),
+                close,
+                fast,
+                slow,
+                rd.ratio,
+                int(rd.level),
+                fc.vol if fc else float("nan"),
+                int(fc.regime) if fc else -1,
+            )
+        )
+        full = len(self.minute) == self.minute.maxlen
+        move = math.log(close / self.minute[0]) if full else float("nan")
+        nan = float("nan")
+        return [
+            dict(
+                time=pd.Timestamp(end_s, unit="s", tz="UTC"),
+                kind=kind,
+                previous=prev,
+                level=new,
+                forecast_ratio=fc.ratio if fc else nan,
+                forecast_vol=fc.vol if fc else nan,
+                ratio=rd.ratio,
+                fast_vol=fast,
+                slow_vol=slow,
+                price=close,
+                move_1m=move,
+            )
+            for kind, prev, new in changes
+        ]
 
 
-class LiveSpikeMonitor:
+class LiveMonitor:
     def __init__(
         self,
         instruments: Iterable[str],
         config: DetectorConfig | None = None,
         on_alert: Callable[[Alert], None] | None = None,
+        models: dict[str, HARModel] | None = None,
     ):
+        """``models`` maps instruments to HAR coefficients; defaults ship with the package."""
         self.config = config or DetectorConfig()
-        self._state = {i: _InstrumentState(self.config) for i in instruments}
+        instruments = list(instruments)
+        models = models or {}
+        self.models = {i: models.get(i) or default_model(i) for i in instruments}
+        self._state = {i: self._new_state(i) for i in instruments}
         self._dvol: dict[str, float] = {}
         self._alerts: deque[Alert] = deque(maxlen=500)
         self._on_alert = on_alert
         self._lock = threading.Lock()
+
+    def _new_state(self, instrument: str) -> _InstrumentState:
+        return _InstrumentState(self.config, self.models[instrument])
 
     @property
     def instruments(self) -> list[str]:
@@ -166,8 +229,9 @@ class LiveSpikeMonitor:
 
     @property
     def seed_span(self) -> pd.Timedelta:
-        """History downloaded at start-up: the warm-up plus as much again for the charts."""
-        return pd.Timedelta(seconds=1.5 * self.config.warmup_bars * self.config.bar_seconds)
+        """History downloaded at start-up: the warm-up plus two hours shown on the charts."""
+        warm = self.config.warmup_bars * self.config.bar_seconds
+        return pd.Timedelta(seconds=warm + 2 * 3600)
 
     # -- seeding ------------------------------------------------------------
 
@@ -182,7 +246,7 @@ class LiveSpikeMonitor:
         list matches the charts, but ``on_alert`` is not called for them.
         """
         for instrument, df in trades.items():
-            st = _InstrumentState(self.config)
+            st = self._new_state(instrument)
             if len(df):
                 closes = bar_closes(df, self.config.bar_seconds)
                 step = st.sampler.step
@@ -193,9 +257,8 @@ class LiveSpikeMonitor:
                 # Completed bars go through the detector; the last one is still in progress.
                 replayed = []
                 for t, c in zip(starts[:-1], closes.to_numpy()[:-1], strict=True):
-                    change = st.add_bar(int(t), float(c), int(counts.get(t // step, 0)))
-                    if change is not None:
-                        replayed.append(self._make_alert(instrument, st, change, live=False))
+                    for draft in st.add_bar(int(t), float(c), int(counts.get(t // step, 0))):
+                        replayed.append(self._make_alert(instrument, draft, live=False))
                 last = int(starts[-1] // step)
                 st.sampler = GridSampler(self.config.bar_seconds, last, float(closes.iloc[-1]))
                 st.sampler.trades = int(counts.get(last, 0))
@@ -203,8 +266,8 @@ class LiveSpikeMonitor:
             with self._lock:
                 self._state[instrument] = st
                 if len(df):
-                    known = {(a.instrument, a.time) for a in self._alerts}
-                    fresh = [a for a in replayed if (a.instrument, a.time) not in known]
+                    known = {(a.instrument, a.time, a.kind) for a in self._alerts}
+                    fresh = [a for a in replayed if (a.instrument, a.time, a.kind) not in known]
                     merged = sorted([*self._alerts, *fresh], key=lambda a: a.time)
                     self._alerts = deque(merged, maxlen=self._alerts.maxlen)
             log.info("seeded %s with %d trades", instrument, len(df))
@@ -239,50 +302,38 @@ class LiveSpikeMonitor:
     def _add_bars(self, instrument: str, st: _InstrumentState, bars) -> list[Alert]:
         out = []
         for start_ms, close, n in bars:
-            change = st.add_bar(start_ms, close, n)
-            if change is not None:
-                alert = self._make_alert(instrument, st, change)
+            for draft in st.add_bar(start_ms, close, n):
+                alert = self._make_alert(instrument, draft)
                 self._alerts.append(alert)
                 out.append(alert)
         return out
 
-    def _make_alert(self, instrument: str, st: _InstrumentState, change, live=True) -> Alert:
-        snap = self._snapshot(instrument, st)
-        return Alert(
-            time=snap.time,
-            instrument=instrument,
-            level=change[1],
-            previous=change[0],
-            ratio=snap.ratio,
-            fast_vol=snap.fast_vol,
-            slow_vol=snap.slow_vol,
-            price=snap.price,
-            move_1m=snap.move_1m,
-            dvol=snap.dvol if live else None,
-            live=live,
-        )
+    def _make_alert(self, instrument: str, draft: dict, live: bool = True) -> Alert:
+        dvol = self._dvol.get(DVOL_INDEX.get(instrument.split("-")[0], "")) if live else None
+        return Alert(instrument=instrument, dvol=dvol, live=live, **draft)
 
     # -- output ------------------------------------------------------------
 
     def _snapshot(self, instrument: str, st: _InstrumentState) -> Snapshot | None:
-        if st.detector is None or not st.history:
+        if st.detector is None or st.forecast is None or not st.history:
             return None
-        det, ppy = st.detector, self.config.bars_per_year
-        fast = math.sqrt(det.fast_var * ppy)
-        price = st.closes[-1]
+        det, fc, ppy = st.detector, st.forecast, self.config.bars_per_year
+        price = st.sampler.close if st.sampler.close is not None else st.closes[-1]
         full_minute = len(st.closes) == st.closes.maxlen
         return Snapshot(
             instrument=instrument,
             time=pd.Timestamp(st.history[-1][0], unit="ms", tz="UTC"),
             price=price,
+            regime=fc.regime,
+            regime_since=pd.Timestamp(st.regime_since, unit="s", tz="UTC"),
+            forecast_ratio=fc.ratio,
+            forecast_vol=fc.vol,
+            sigma_5m=price * fc.vol * math.sqrt(HORIZON_SECONDS / SECONDS_PER_YEAR),
             level=det.level,
-            level_since=pd.Timestamp(st.level_since, unit="s", tz="UTC"),
             ratio=det.ratio,
-            fast_vol=fast,
+            fast_vol=math.sqrt(det.fast_var * ppy),
             slow_vol=math.sqrt(det.slow_var * ppy),
-            move_1m=math.log(price / st.closes[0]) if full_minute else float("nan"),
-            sigma_1m=price * fast * math.sqrt(60.0 / SECONDS_PER_YEAR),
-            activity=st.rate.ratio,
+            move_1m=math.log(st.closes[-1] / st.closes[0]) if full_minute else float("nan"),
             dvol=self._dvol.get(DVOL_INDEX.get(instrument.split("-")[0], "")),
         )
 
@@ -298,10 +349,19 @@ class LiveSpikeMonitor:
             return list(self._alerts)
 
     def history(self, instrument: str) -> pd.DataFrame:
-        """Recent bars: price, fast and slow annualized vol, ratio and level."""
+        """Recent bars: price, annualized vols, spike ratio and level, forecast and regime."""
         with self._lock:
             rows = list(self._state[instrument].history)
-        cols = ["time", "price", "fast_vol", "slow_vol", "ratio", "level"]
+        cols = [
+            "time",
+            "price",
+            "fast_vol",
+            "slow_vol",
+            "ratio",
+            "level",
+            "forecast_vol",
+            "regime",
+        ]
         df = pd.DataFrame(rows, columns=cols)
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         return df.set_index("time")
@@ -312,7 +372,7 @@ class LiveSpikeMonitor:
         self,
         stream: DeribitStream | None = None,
         rest: DeribitREST | None = None,
-        on_bar: Callable[[LiveSpikeMonitor], None] | None = None,
+        on_bar: Callable[[LiveMonitor], None] | None = None,
     ) -> None:
         """Consume the stream forever, seeding at start and after every reconnection."""
         stream = stream or DeribitStream(self.instruments, self.dvol_indices)
