@@ -4,99 +4,138 @@
 ![python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-A live monitor that flags short-term volatility spikes on BTC and ETH perpetuals (Deribit), updated every 10 seconds.
+Real-time five-minute volatility forecast and market-regime classifier for BTC and ETH perpetuals on Deribit, with a short-term spike detector.
 
-The monitor compares two volatilities measured on the same returns:
+Every 10 seconds, from the live trade feed (WebSocket), the monitor answers two questions:
 
-- **vol 1m**: how much the market moves right now (about the last minute);
-- **normal**: how much it moved over the last half hour.
+- **How much will the market move over the next 5 minutes?** It gives a volatility forecast, the matching one-standard-deviation price move, and a regime: `CALM`, `NORMAL`, `ACTIVE` or `STRESSED`.
+- **Is something happening right now?** The spike detector compares the volatility of the last minute with the normal level.
 
-When vol 1m reaches 2× normal, the state goes to `ELEVATED`; at 3×, it goes to `SPIKE`. Each escalation is an alert, printed and optionally written to a JSON log.
-
-The repository also replays the detector on the past trade tape and measures what its alerts were worth. Only Deribit's public API is used, so no account or key is needed.
+Everything is fitted on past trades and checked on days the model has never seen. Direction was tested as well: no signal was found that predicts it (see [What does not work](#what-does-not-work)). Only Deribit's public API is used, so no account or key is needed.
 
 ```
-10s bars | vol 1m = EWMA half-life 60s, normal = 30m | elevated >= 2x, spike >= 3x, reset < 1.5x | 08:56:20 UTC
+10:33:40 UTC | regime = forecast of the next 5 minutes | spike = vol 1m vs normal (30m): elevated >= 2x, spike >= 3x
 
-                 price  state    for ratio vol 1m normal move 1m 1sd 1m trades  dvol
-BTC-PERPETUAL 81,420.5 NORMAL 16m30s 0.77x  27.6%  35.8%  +0.1bp  31.05   0.5x 37.2%
-ETH-PERPETUAL  2,369.9 NORMAL 17m50s 0.34x  18.0%  52.3%  -0.6bp   0.59   0.5x 52.3%
+                 price regime    for next 5m vol vs normal 1sd 5m  spike vol 1m normal move 1m  dvol
+BTC-PERPETUAL 81,451.0 NORMAL 22m00s       21.4%     0.86x  53.65 NORMAL  27.2%  24.9%  +2.2bp 37.1%
+ETH-PERPETUAL  2,367.8 NORMAL  0m30s       23.9%     0.77x   1.74 NORMAL  27.3%  31.1%  +1.5bp 52.5%
 
 alerts
-08:35:40  ETH-PERPETUAL    normal -> elevated  ratio 2.76x  vol 1m 158.7%  normal  57.5%  move 1m +38.1bp  @ 2,379.8  (history)
-08:35:40  BTC-PERPETUAL    normal -> elevated  ratio 2.35x  vol 1m  72.2%  normal  30.7%  move 1m +18.3bp  @ 81,547.5  (history)
-08:26:40  ETH-PERPETUAL    normal -> spike     ratio 4.20x  vol 1m 192.8%  normal  45.9%  move 1m +40.7bp  @ 2,373.9  (history)
-08:26:40  BTC-PERPETUAL  elevated -> spike     ratio 4.04x  vol 1m  96.1%  normal  23.8%  move 1m +22.4bp  @ 81,322.0  (history)
-08:26:30  BTC-PERPETUAL    normal -> elevated  ratio 2.60x  vol 1m  45.6%  normal  17.6%  move 1m  +7.5bp  @ 81,203.0  (history)
+10:07:00  ETH-PERPETUAL  regime   normal -> stressed  next 5m  40.5% (1.14x)  vol 1m  65.2% (1.84x)  move 1m -10.3bp  @ 2,367.8  (history)
+08:35:40  ETH-PERPETUAL  spike    normal -> elevated  next 5m  84.5% (1.46x)  vol 1m 158.7% (2.74x)  move 1m +38.1bp  @ 2,379.8  (history)
+08:35:40  BTC-PERPETUAL  spike    normal -> elevated  next 5m  45.4% (1.46x)  vol 1m  72.2% (2.33x)  move 1m +18.3bp  @ 81,547.5  (history)
 ```
 
 ![Example](docs/img/example.png)
 
-*The largest alert in the sample. At 12:30 UTC, BTC falls 0.9% in 30 seconds and 1.3% within three minutes. The ratio jumps to 5×. The monitor stays at SPIKE for about 4 minutes, then at ELEVATED, and returns to NORMAL 5½ minutes after the move. The ELEVATED alert at 12:05 is a smaller burst that faded on its own.*
+*One out-of-sample example, chosen because it is easy to read: the model was fitted on September only and is drawn here on 2026-10-14.*
+
+- The forecast (blue) sits in `ACTIVE` and `STRESSED` from 12:00, after a first burst of activity.
+- It is back in `STRESSED` at 12:28. US data are released at 12:30 UTC, and the time-of-day term knows that this slot is usually volatile.
+- At 12:30, BTC falls 0.9% in 30 seconds, and the realized volatility of the next five minutes reaches 10× normal. The spike detector (red dots) fires only once the move has happened.
+- After the shock, the forecast decays faster than the one-minute volatility, and the regime leaves `STRESSED` at 12:38.
+
+The statistics below are what to judge the model on.
 
 ---
 
+## Results (out of sample)
+
+Data: every Deribit trade over 44 days, 11.1 million on BTC and 4.2 million on ETH, cut in two periods:
+
+- **Sep**: 2026-09-14 to 2026-10-13;
+- **Oct**: 2026-10-14 to 2026-10-27.
+
+The model is fitted on one period and scored on the other, in both directions. Scored windows are non-overlapping five-minute windows. Intervals are 95%, from a stationary block bootstrap with one-hour blocks.
+
+### Accuracy of the five-minute forecast
+
+Out-of-sample R² of log(realized vol over the next 5 minutes / normal vol):
+
+| forecast | BTC, tested on Oct | BTC, tested on Sep | ETH, tested on Oct | ETH, tested on Sep |
+|---|---:|---:|---:|---:|
+| unchanged normal level | −0.12 | −0.12 | −0.13 | −0.14 |
+| volatility of the last 5 minutes | −0.18 | −0.23 | −0.13 | −0.24 |
+| volatility of the last minute (spike detector) | −0.26 | −0.28 | −0.18 | −0.29 |
+| **model** | **+0.17** | **+0.14** | **+0.17** | **+0.13** |
+| MSE reduction vs last 5 minutes, 95% CI | [0.040, 0.056] | [0.056, 0.073] | [0.035, 0.047] | [0.058, 0.072] |
+| Mincer-Zarnowitz slope (1 = unbiased scale) | 0.97 | 0.93 | 0.97 | 0.90 |
+
+- Over five minutes, simply carrying forward the recent volatility is worse than assuming the normal level, because short-term volatility mean-reverts quickly.
+- The model explains 13 to 17% of the variance of log volatility, which is a good result for a noisy five-minute target.
+- The Mincer-Zarnowitz slope stays close to 1 out of sample: the forecasts have the right scale, without over- or under-reaction.
+
+### Regimes
+
+![Regimes](docs/img/regimes.png)
+
+Share of five-minute windows that turn out *violent* (realized vol at least 2× normal), by the regime shown at the start of the window:
+
+| regime | share of time | realized vol / normal (median) | P(violent), BTC | P(violent), ETH | spike detector not firing |
+|---|---:|---:|---:|---:|---:|
+| `CALM` | 13–20% | 0.69–0.74 | 0.5–1.2% | 0.8–1.2% | 100% |
+| `NORMAL` | 48–52% | 0.82–0.84 | 1.3–1.5% | 1.3–1.4% | 100% |
+| `ACTIVE` | 25–27% | 0.95–0.98 | 1.9–2.1% | 2.4–3.5% | 96–99% |
+| `STRESSED` | 6.5–8% | 1.17–1.27 | **11.8–12.7%** | **12.3–12.5%** | **64–68%** |
+
+Ranges cover the two test directions. The full tables with intervals are printed by `volengine study`.
+
+- A violent five minutes is 8 to 10 times more likely in `STRESSED` than in `NORMAL`, and 10 to 25 times more likely than in `CALM`, for both assets and in both directions. The intervals do not overlap.
+- Two thirds of the `STRESSED` windows begin while the spike detector is still quiet. The regime is a warning ahead of the move, not a restatement of it.
+- `CALM` windows are genuinely quiet, at 0.7× normal. For a market maker or a stop placement, that is as useful as the warning.
+
+### What does not work
+
+`scripts/feature_search.py` reproduces the full search.
+
+- **More inputs for volatility.** Order-flow imbalance, liquidation volume and the perpetual-index basis add nothing out of sample beyond the six terms used.
+- **Direction.** Several candidates were tested for predicting the sign of the next 1, 5 and 15 minutes:
+  - trade imbalance over the last minute;
+  - the last move;
+  - Deribit's spot index moving before the perpetual;
+  - changes in the basis.
+
+  Every Spearman correlation is below 0.05 in absolute value, and a third of them change sign between periods. The most stable pattern is a mild reversal over 15 minutes after a large one-minute move. Fading moves beyond 2 standard deviations earns 1.5 to 3 bp on average. That is not significant (t-statistics between 0.9 and 1.4) and is below the 10 bp round-trip taker fee. **This tool tells you how much the market is likely to move, not which way.**
+
+### Spike detector
+
+The detector flags a move as it happens, so it is coincident by design. When it is flagged, the next five minutes are violent 6 to 10 times more often than when it is not; the 95% intervals start at 4 in every period and asset. After an alert, the excess volatility halves in about 10 minutes:
+
+![After a spike alert](docs/img/after_alert.png)
+
 ## Dashboard
 
-`streamlit run dashboard/app.py` shows the same monitor with the last hours of price and ratio, alert periods shaded (orange = elevated, red = spike), and the alert list.
+`streamlit run dashboard/app.py` shows the same monitor with charts, refreshed every second:
+
+- price, with spike alerts as red dots;
+- forecast, realized and normal volatility;
+- `ACTIVE` and `STRESSED` periods shaded;
+- the alert list.
 
 ![Dashboard](docs/img/dashboard.png)
 
 ## What each column means
 
-| column | meaning | how a trader can use it |
+| column | meaning | use |
 |---|---|---|
-| `state` | `NORMAL`, `ELEVATED` (ratio ≥ 2) or `SPIKE` (ratio ≥ 3); back to normal below 1.5 | widen quotes or stops, cut size, pause a strategy |
-| `for` | time spent in the current state | a spike that has lasted 10 minutes is a regime, not a print |
-| `ratio` | vol 1m / normal | unit-free, so the same thresholds hold for BTC and ETH, at night or during US hours |
-| `vol 1m` | annualized volatility, EWMA with a 1-minute half-life | the current level |
-| `normal` | annualized volatility, EWMA with a 30-minute half-life | the reference the ratio is measured against |
-| `move 1m` | price change over the last minute | the direction of the move behind the alert |
-| `1sd 1m` | one-standard-deviation price move over one minute at the current vol 1m | size stops and limit offsets in price units |
-| `trades` | trades per bar, fast / slow average | activity often surges together with volatility |
-| `dvol` | Deribit's 30-day implied volatility index | the options market's view, for context |
+| `regime` | forecast class for the next 5 minutes; rises at once, falls after one minute below its threshold | size, spreads, pausing a strategy |
+| `for` | time in the current regime | |
+| `next 5m vol` | forecast volatility over the next 5 minutes, annualized | |
+| `vs normal` | the same divided by the 30-minute normal volatility | unit-free; the regime cut points are on this scale |
+| `1sd 5m` | one-standard-deviation price move over the next 5 minutes, in USD | stop distance, quote width |
+| `spike` | `NORMAL`, `ELEVATED` (vol 1m ≥ 2× normal) or `SPIKE` (≥ 3×) | something is happening now |
+| `vol 1m`, `normal` | realized volatility, EWMA half-lives of 1 and 30 minutes, annualized | |
+| `move 1m` | price change over the last minute, in bp | the direction of what just happened |
+| `dvol` | Deribit's 30-day implied volatility index | context from the options market |
 
-Alerts marked `(history)` were found in the three hours of trades loaded at start-up. They are listed so the alert list matches the charts, but they are not sent to the alert log.
-
-Alerts are also written with `--log`, one JSON object per line. The record below comes from a replay of 2026-10-14; `dvol` is null because the replay has no DVOL feed.
+Alerts are raised when the regime enters `STRESSED` (it re-arms once back to `NORMAL` or `CALM`) and when the spike detector escalates. With `--log`, they are written one JSON object per line:
 
 ```json
-{"time": "2026-10-14T12:05:40+00:00", "instrument": "BTC-PERPETUAL", "level": "elevated", "previous": "normal", "ratio": 2.008927, "fast_vol": 0.476555, "slow_vol": 0.237218, "price": 83595.0, "move_1m": 3.6e-05, "dvol": null}
+{"time": "2026-10-28T10:07:00+00:00", "instrument": "ETH-PERPETUAL", "kind": "regime", "previous": "normal", "level": "stressed", "forecast_ratio": 1.139505, "forecast_vol": 0.405181, "ratio": 1.83287, "fast_vol": 0.651725, "slow_vol": 0.355576, "price": 2367.8, "move_1m": -0.001034, "dvol": null, "live": false}
 ```
 
-## Does it work?
-
-The detector was replayed bar by bar on every Deribit trade over two periods:
-
-- **2026-10-14 to 2026-10-27**: 14 days, 4.6 million BTC and 1.5 million ETH trades. The README was first written on this period.
-- **2026-09-14 to 2026-10-13**: 30 days, 6.5 million BTC and 2.7 million ETH trades, held out and analyzed afterwards without changing anything.
-
-The parameters (10-second bars, half-lives of 1 and 30 minutes, thresholds 2 / 3 / 1.5) were set from the alert frequency alone and were never tuned on the outcomes below. Reproduce with `volengine study BTC-PERPETUAL --end 2026-10-28 --days 14`, or `--end 2026-10-14 --days 30` for the held-out period.
-
-**After an alert, is the next stretch of time more violent?** The sample is cut into non-overlapping 5-minute windows. For each window, the detector's state is read at its start, using past data only. A window is *violent* if its realized volatility is at least 2× the normal volatility at its start.
-
-| | BTC Oct | BTC Sep (held out) | ETH Oct | ETH Sep (held out) |
-|---|---:|---:|---:|---:|
-| alerts per day (of which to `SPIKE`) | 15.4 (1.4) | 18.0 (2.0) | 14.6 (2.1) | 18.6 (2.7) |
-| time spent flagged | 3.3% | 3.4% | 2.9% | 3.4% |
-| P(next 5 min violent), state `NORMAL` | 1.8% [1.4, 2.2] | 2.0% [1.7, 2.3] | 1.9% [1.5, 2.4] | 2.2% [1.9, 2.6] |
-| P(next 5 min violent), state `ELEVATED` | 12% [6, 17] | 10% [6, 13] | 17% [10, 25] | 10% [7, 14] |
-| P(next 5 min violent), state `SPIKE` | 21% [0, 45] | 31% [15, 48] | 27% [10, 44] | 30% [17, 44] |
-| **lift** (flagged / not flagged) | **7.2** [4.2, 10.8] | **6.2** [4.2, 8.5] | **10.1** [6.1, 15.2] | **5.9** [4.2, 7.8] |
-| violent windows already flagged at their start | 20% [12, 27] | 18% [13, 23] | 24% [15, 32] | 17% [12, 22] |
-
-95% intervals in brackets, from a stationary block bootstrap with one-hour blocks.
-
-- Being flagged makes a violent next five minutes roughly 6 to 10 times more likely, on both instruments and in both periods.
-- In every case, the lower bound of the interval is above 4.
-
-**How long does it last?** The figure below shows realized volatility over the next 1 to 60 minutes after each new alert, relative to normal. Alerts are kept only if they are at least 30 minutes apart.
-
-![After an alert](docs/img/after_alert.png)
-
-- In the minute after an alert, volatility runs at 1.4× to 1.7× normal. At a random moment the median is 0.75×.
-- The excess halves in about 10 minutes and is nearly gone after an hour, at about 1.1×.
-- **The alert does not predict the first jump.** About four out of five violent windows start while the monitor is still at `NORMAL`, because the move arrives in a single print (data releases, liquidations). The alert says that a high-volatility regime has started and that it tends to last several minutes. That is the information a trader can act on.
+- **History alerts.** Alerts found in the four hours of trades loaded at start-up are listed with the mark `(history)` so the list matches the charts, but they are not written to the log.
+- **The record above.** It is one of those, which is why `live` is false and `dvol` is null. A live alert carries the current DVOL.
 
 ## Usage
 
@@ -109,78 +148,83 @@ pip install -e ".[dashboard]"     # core only: pip install -e .
 ```bash
 volengine live                                   # BTC and ETH
 volengine live BTC-PERPETUAL --log alerts.jsonl --bell
-volengine live --bar 5 --elevated 2.5            # every parameter can be changed
-volengine study ETH-PERPETUAL --days 14          # replay and score on past trades
-streamlit run dashboard/app.py                   # same monitor, with charts
+streamlit run dashboard/app.py
+volengine study ETH-PERPETUAL --end 2026-10-28   # fit on 30 days, score on the next 14
+volengine fit --days 44 --out models.json        # re-estimate; use with live --models
 ```
 
-At start-up, the monitor downloads the last three hours of trades (about 5 seconds) so that the normal volatility is meaningful from the first bar. `volengine study` caches downloaded days in `~/.cache/volengine`. The first run for 14 days of BTC takes a few minutes; later runs take seconds.
+- **Start-up.** The monitor downloads the last four hours of trades (about 5 seconds), so that the normal volatility and the forecast are warm from the first bar.
+- **Cache.** `volengine study` and `volengine fit` cache downloaded days in `~/.cache/volengine`. The first download of 44 days takes 15 to 30 minutes; later runs take seconds.
 
 From Python:
 
 ```python
-from volengine.live import LiveSpikeMonitor
+from volengine.live import LiveMonitor
 
-monitor = LiveSpikeMonitor(["BTC-PERPETUAL"], on_alert=lambda a: print(a.as_dict()))
+monitor = LiveMonitor(["BTC-PERPETUAL"], on_alert=lambda a: print(a.as_dict()))
 monitor.start_background()  # or: await monitor.run()
-monitor.snapshot("BTC-PERPETUAL")  # Snapshot(level=..., ratio=..., fast_vol=..., sigma_1m=...)
+monitor.snapshot("BTC-PERPETUAL")  # Snapshot(regime=..., forecast_vol=..., sigma_5m=..., ...)
 ```
 
 ## The model
 
-On each 10-second bar, with r the log return of the last traded price:
+Bars are 10 seconds long. *Normal* is an EWMA of squared returns with a 30-minute half-life. The forecast is ordinary least squares on non-overlapping five-minute windows:
 
 ```
-fast ← λf · fast + (1 − λf) · r²     half-life 1 minute    (λf = 0.891)
-slow ← λs · slow + (1 − λs) · r²     half-life 30 minutes  (λs = 0.9962)
-ratio = √(fast / slow)
+log(vol next 5m / normal) = c + b1·x1 + b5·x5 + b30·x30 + bs·season + bt·trades + bm·absmove
 ```
 
-The state rises as soon as the ratio crosses 2 or 3 and falls back to `NORMAL` only below 1.5. This hysteresis stops the state from flickering when the ratio hovers around a threshold.
+| term | definition | BTC coefficient (shipped) |
+|---|---|---:|
+| `x1`, `x5`, `x30` | log(realized vol over the last 1, 5, 30 min / normal) | −0.004, +0.200, +0.167 |
+| `season` | log volatility of the coming 5-minute slot of the day relative to the daily average, from the training days | +0.806 |
+| `trades` | log(trades in the last minute / average per minute over 30 minutes) | +0.067 |
+| `absmove` | \|price change over the last minute\| in normal standard deviations | +0.061 |
 
-Design choices:
-
-- **A ratio, not a level.** A 40% annualized vol is calm for ETH during US hours and agitated for BTC on a Sunday night. Comparing with the instrument's own recent level removes the need for per-asset or per-hour calibration.
-- **Squared returns, not a robust estimator.** Jumps are exactly what should trigger an alert, so they are not filtered out.
-- **10-second bars.** Over the 14 days, realized volatility from trade prices barely depends on the sampling interval: 32.0% at 1 s, 32.1% at 10 s and 34.1% at 1 min on BTC. So bid-ask bounce does not inflate short-interval estimates here. 10 s is fast enough to flag a move within one bar while leaving only 8% of BTC bars without a trade. ETH trades less (17% empty bars at 10 s), which lowers its 10-second vol by about 8% against 1-minute sampling. Because the signal is a ratio, a constant bias cancels.
+- **The terms.** The first three are the HAR model of Corsi (2009) moved to intraday horizons; the 5- and 30-minute volatilities carry most of the information. The time-of-day term captures the US open and scheduled releases. Each added term improves the out-of-sample R² in all four tests (`scripts/feature_search.py`).
+- **The regimes.** Cut points are the 25th, 75th and 95th percentiles of the forecast on the training data. On BTC, a forecast below 0.78× normal is `CALM` and one above 1.15× is `STRESSED`.
+- **Shipped coefficients.** The coefficients in `src/volengine/models.json` are fitted on all 44 days. ETH's are within 0.03 of BTC's. The out-of-sample results above use models fitted on one period only.
 
 ## How it is built
 
-- **One data definition.** Live bars come from the `trades.{instrument}.100ms` WebSocket channel. Historical bars come from the same trades on `history.deribit.com`. A bar's price is its last trade; a bar without a trade keeps the previous price. The streaming sampler and the batch sampler are tested to produce identical series.
-- **Start-up without a hole or a duplicate.** The monitor subscribes first and buffers what arrives, downloads recent history, and runs the detector over it. It then replays the buffered trades that the download did not contain, matching them by trade id. A test checks that seeding followed by live trades gives exactly the same volatilities as a batch replay of the whole tape.
-- **Bars close on time.** Bars close on exchange time, even when no trade prints. The DVOL feed ticks about once per second and closes any bar that ended more than one second earlier.
-- **Reconnection.** Deribit heartbeats keep the connection alive, with exponential backoff on failure. After a reconnection, the monitor re-seeds from history so the gap is filled with real trades.
+- **Data.** Live bars come from the `trades.{instrument}.100ms` WebSocket channel; measured latency from exchange timestamp to receipt is 150 to 190 ms median and about 330 ms at the 95th percentile. Historical bars come from the same trades on `history.deribit.com`. A bar's price is its last trade, and a bar without a trade keeps the previous price.
+- **One code path.** The streaming and batch implementations of the sampler, the detector and the forecast are tested to give identical numbers, to 1e-9. The figures above are therefore exactly what the live monitor would have shown.
+- **Start-up and reconnection.** The monitor subscribes first and buffers, then downloads recent history and runs the models over it. It then replays the buffered trades that the download missed, matching them by trade id. After a disconnection it does the same again, so the gap is filled with real trades.
+- **Clock.** Bars close on exchange time even when no trade prints: the DVOL feed ticks twice a second and closes any bar that ended more than a second earlier.
 
 ## Statistical design
 
-- **No look-ahead.** The state is read at the start of each evaluation window, and the window's volatility uses only later returns.
-- **Dependence.** Neighbouring windows are not independent because volatility clusters, so intervals use the stationary bootstrap (Politis & Romano, 1994) with one-hour blocks. Alerts in the after-alert curve are at least 30 minutes apart and resampled independently.
+- **No look-ahead.** Every input is known at the close of the bar, and the target uses only later returns. The time-of-day profile and the regime cut points come from the training period only.
+- **Both directions.** Each model is scored on a period it was not fitted on, forward in time and backward. The four results agree.
+- **Dependence.** Neighbouring windows are not independent, so intervals use the stationary bootstrap (Politis & Romano, 1994) with one-hour blocks.
+- **Market closures.** Five-minute windows without any price change at all (about 40 per instrument in 44 days) are dropped from fitting and scoring.
 - **Checks under the null** (in `tests/`):
-  - With Gaussian returns at constant volatility, the detector raises no alert in two simulated days.
-  - With independent jumps but no volatility clustering, it raises alerts, as it should, but they predict nothing: the lift interval includes 1, and volatility after an alert is no higher than at a random time.
-  - On simulated volatility bursts, the lift is clearly above 1. The real-data results above are therefore not produced by the method itself.
-- **Coverage.** The stationary bootstrap and the Wilson interval are checked for coverage by simulation.
+  - With constant volatility, the forecast has no skill (R² < 0.02), and the spike detector raises no alert with Gaussian returns.
+  - With independent jumps, alerts fire but predict nothing.
+  - On simulated volatility clusters, the forecast beats the naive ones.
 
 ## Limitations
 
-- **Six weeks of data.** The two periods together cover 44 days, which is short next to the variety of crypto market conditions. The `SPIKE` rows rest on 14 to 43 windows, hence their wide intervals.
-- **Trade prices, not quotes.** Deribit does not publish historical order-book quotes, so both the study and the monitor use trades to stay identical. Quotes would give a cleaner price on illiquid instruments.
-- **No intraday seasonality model.** The 30-minute normal level adapts to the time of day only gradually. In the sample, 13:00–14:00 UTC (around the US equity open) has more than twice the average hourly number of alerts, and 12:00–16:00 UTC accounts for about a quarter of them. This is intended: those are the hours when volatility actually changes.
-- **Scope.** The study measures how violent the next minutes are, not their direction. It is not a trading signal by itself.
+- **44 days.** Both periods belong to one market environment. The time-of-day profile in particular should be re-estimated regularly with `volengine fit`.
+- **Trade prices, not quotes.** Deribit publishes no historical order book, so both the study and the monitor use trades to stay identical.
+- **The first jump.** A third of the `STRESSED` windows only start once the spike detector is already firing. A move that comes out of nowhere is still seen only when it happens.
+- **Not a trading signal by itself.** The model forecasts the size of moves, not their direction.
 
 ## Project layout
 
 ```
 src/volengine/
-  detector.py     fast/slow EWMA, ratio, alert levels with hysteresis
-  sampling.py     trades -> regular bars (batch and streaming, identical)
+  forecast.py     five-minute forecast, regimes (batch and streaming)
+  detector.py     spike detector: fast/slow EWMA ratio with hysteresis
+  sampling.py     trades -> 10-second bars (batch and streaming, identical)
   live.py         live monitor: seeding, buffering, alerts, snapshots
-  study.py        replay on past trades, forward-volatility evaluation
+  study.py        out-of-sample evaluation, model fitting, trade cache
   stats.py        stationary bootstrap, Wilson interval
-  deribit/        REST trade history (paginated) and WebSocket stream (heartbeat, reconnect)
+  models.json     shipped coefficients
+  deribit/        REST trade history and WebSocket stream (heartbeat, reconnect)
   cli.py
 dashboard/app.py  Streamlit front-end
-scripts/          figure generation
+scripts/          figures, feature search
 tests/            unit tests + integration tests against Deribit (pytest -m network)
 ```
 
@@ -193,10 +237,11 @@ ruff check . && ruff format --check .
 
 ## References
 
-- J.P. Morgan / Reuters (1996). *RiskMetrics Technical Document*, exponentially weighted volatility.
-- Andersen, Bollerslev, Diebold & Labys (2000). Great realizations. *Risk*, realized volatility and the sampling frequency.
+- Andersen, Bollerslev, Diebold & Labys (2000). Great realizations. *Risk*.
+- Corsi (2009). A simple approximate long-memory model of realized volatility. *Journal of Financial Econometrics*.
+- Mincer & Zarnowitz (1969). The evaluation of economic forecasts. *NBER*.
 - Politis & Romano (1994). The stationary bootstrap. *JASA*.
-- Wilson (1927). Probable inference, the law of succession, and statistical inference. *JASA*.
+- J.P. Morgan / Reuters (1996). *RiskMetrics Technical Document*.
 
 ## License
 
