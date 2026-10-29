@@ -110,10 +110,10 @@ with st.sidebar:
 
 st.title("Short-term volatility monitor")
 st.caption(
-    "Deribit perpetuals, 10-second bars, updated live over WebSocket. **Regime** = forecast of "
-    "the volatility over the next 5 minutes (intraday HAR), ranked against the training "
-    "period: CALM (lowest 25%), NORMAL, ACTIVE, STRESSED (top 5%). **Spike** = volatility over "
-    "the last minute vs the 30-minute normal: elevated at 2x, spike at 3x."
+    "Deribit perpetuals, 10-second bars, live over WebSocket. **P(violent)** = probability that "
+    "the next 5 minutes move at least twice the normal (30-minute) volatility. **Regime** = "
+    "rank of the 5-minute forecast among the training forecasts: CALM (lowest 25%), NORMAL, "
+    "ACTIVE, STRESSED (top 5%). **Spike** = last minute vs normal: elevated 2x, spike 3x."
 )
 
 if not instruments:
@@ -126,7 +126,7 @@ monitor = get_monitor(tuple(instruments), DetectorConfig())
 def render() -> None:
     snaps = {s.instrument: s for s in monitor.snapshots()}
     if not snaps:
-        st.info("Loading the last four hours of trades from Deribit to warm up the models...")
+        st.info("Loading the last day of bars (store, then Deribit) to warm up the models...")
         return
     for inst in instruments:
         s = snaps.get(inst)
@@ -137,17 +137,24 @@ def render() -> None:
             f"### {inst} &nbsp; {badge(s.regime.name, REGIME_COLOR[s.regime])} "
             f"<span style='font-size:0.7em;color:gray'>for {duration(s.time - s.regime_since)}"
             f"</span> &nbsp; {badge('spike: ' + s.level.name, LEVEL_COLOR[s.level])} "
-            f"<span style='font-size:0.7em;color:gray'>· {s.time:%H:%M:%S} UTC</span>",
+            f"<span style='font-size:0.7em;color:gray'>· {s.time:%H:%M:%S} UTC · latency "
+            f"{'n/a' if s.latency_ms is None else f'{s.latency_ms:.0f} ms'} · "
+            f"sequence holes {s.seq_gaps}</span>",
             unsafe_allow_html=True,
         )
-        c = st.columns(6)
+        c = st.columns(7)
         c[0].metric("Price", price(s.price), bp(s.move_1m), help="change over the last minute")
+        c[6].metric(
+            "P(violent)",
+            pct(s.p_violent),
+            help="P(vol over the next 5 minutes >= 2x normal); about 3% on average",
+        )
         c[1].metric(
             "Next 5m vol",
             pct(s.forecast_vol),
             f"{s.forecast_ratio:.2f}x normal",
             delta_color="off",
-            help="HAR forecast, annualized",
+            help="forecast, annualized",
         )
         c[2].metric(
             "1 sd move, 5m", f"±{price(s.sigma_5m)}", help="one standard deviation, forecast"
@@ -190,7 +197,9 @@ def render() -> None:
             "move_1m": "move 1m",
         }
     )
-    cols = ["time", "instrument", "kind", "change", "next 5m vol", "next 5m / normal"]
+    table["p_violent"] = table["p_violent"].map(pct)
+    table = table.rename(columns={"p_violent": "P(violent)"})
+    cols = ["time", "instrument", "kind", "change", "P(violent)", "next 5m vol"]
     rest = [c for c in table.columns if c not in cols]
     st.dataframe(table[cols + rest], hide_index=True, width="stretch")
 

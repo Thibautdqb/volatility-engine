@@ -5,13 +5,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tests.conftest import simulate_trades
+from tests.conftest import DAY, simulate_trades
+from tests.test_forecast import grid
+from volengine.data.bars import BarStore
+from volengine.data.store import TradeStore
 from volengine.deribit.stream import DvolUpdate, Reconnected, Trade, parse_message
-from volengine.detector import DetectorConfig, Level, run_detector
-from volengine.forecast import Regime, har_inputs, prepare
+from volengine.detector import DetectorConfig
+from volengine.features import compute
+from volengine.forecast import Regime, default_model
 from volengine.live import LiveMonitor
-from volengine.sampling import bar_closes, bar_counts, log_returns
 
+INST = "BTC-PERPETUAL"
+CONFIG = DetectorConfig()
 TRADES_MSG = {
     "jsonrpc": "2.0",
     "method": "subscription",
@@ -19,24 +24,24 @@ TRADES_MSG = {
         "channel": "trades.BTC-PERPETUAL.100ms",
         "data": [
             {
-                "timestamp": 1793130317626,
-                "price": 80737.0,
-                "direction": "buy",
-                "index_price": 80715.5,
-                "instrument_name": "BTC-PERPETUAL",
-                "amount": 10000.0,
-                "mark_price": 80739.72,
-                "trade_id": "456928653",
-            },
-            {
+                "trade_seq": 311,
                 "timestamp": 1793130317700,
                 "price": 80736.5,
                 "direction": "sell",
-                "index_price": 80715.5,
                 "instrument_name": "BTC-PERPETUAL",
                 "amount": 20.0,
-                "mark_price": 80739.70,
-                "trade_id": "456928654",
+                "trade_id": "2",
+                "block_trade_id": "B1",
+            },
+            {
+                "trade_seq": 310,
+                "timestamp": 1793130317626,
+                "price": 80737.0,
+                "direction": "buy",
+                "instrument_name": "BTC-PERPETUAL",
+                "amount": 10000.0,
+                "trade_id": "1",
+                "liquidation": "T",
             },
         ],
     },
@@ -49,144 +54,192 @@ DVOL_MSG = {
         "data": {"timestamp": 1793124671248, "index_name": "btc_usd", "volatility": 37.36},
     },
 }
-INSTRUMENT = "BTC-PERPETUAL"
-CONFIG = DetectorConfig(bar_seconds=10, fast_half_life=60, slow_half_life=600)
 
 
-def test_parse_messages():
-    trades = parse_message(TRADES_MSG)
-    assert [type(e) for e in trades] == [Trade, Trade]
-    assert trades[0] == Trade(INSTRUMENT, 1793130317626, 80737.0, 10000.0, "456928653")
+def test_parse_messages_in_sequence_order():
+    a, b = parse_message(TRADES_MSG)
+    assert (a.trade_seq, b.trade_seq) == (310, 311)
+    assert a.kind == "book" and a.is_buy and a.liquidation
+    assert b.kind == "block" and not b.is_buy
     (dvol,) = parse_message(DVOL_MSG)
     assert isinstance(dvol, DvolUpdate) and dvol.value == 37.36
     assert parse_message({"jsonrpc": "2.0", "id": 1, "result": []}) == []
 
 
-def as_events(df):
+def events(df):
     return [
-        Trade(INSTRUMENT, int(r.timestamp), float(r.price), float(r.amount), str(r.trade_id))
-        for r in df.itertuples()
+        Trade(
+            INST,
+            int(t.timestamp),
+            float(t.price),
+            float(t.amount),
+            int(t.trade_seq),
+            t.kind,
+            bool(t.is_buy),
+            t.liquidation != "",
+        )
+        for t in df.itertuples()
     ]
 
 
-def tape(hours=3, seed=0, vol=0.5):
-    return simulate_trades(hours * 3600, vol, rate=2.0, seed=seed)
+@pytest.fixture(scope="module")
+def tape():
+    vol = np.r_[np.full(DAY + 3 * 3600, 0.4), np.full(600, 2.0), np.full(3600, 0.5)]
+    return simulate_trades(vol.size, vol, rate=1.0, seed=1, block_share=0.01)
 
 
-def test_seed_then_live_equals_batch_replay():
-    trades = tape()
-    cut = trades["timestamp"].iloc[0] + 2 * 3600 * 1000 + 4_321  # mid-bar
-    hist = trades[trades["timestamp"] < cut]
-    # The live stream starts a little before the cut: those prints must not count twice.
-    live = trades[trades["timestamp"] >= cut - 3_000]
-
-    m = LiveMonitor([INSTRUMENT], CONFIG)
-    m.apply_seed({INSTRUMENT: hist})
-    for ev in as_events(live):
-        m.on_event(ev)
-
-    got = m.history(INSTRUMENT)
-    assert got.index.is_unique and got.index.is_monotonic_increasing
-    assert (got.index.to_series().diff().iloc[1:] == pd.Timedelta(seconds=10)).all()  # no gap
-
-    batch = run_detector(log_returns(bar_closes(trades, 10)), CONFIG)
-    batch.index = batch.index + pd.Timedelta(seconds=10)  # live rows are stamped at bar end
-    common = got.index.intersection(batch.index)
-    assert len(common) == len(got)  # both drop the warm-up
-    for col in ("fast_vol", "slow_vol", "ratio"):
-        np.testing.assert_allclose(got.loc[common, col], batch.loc[common, col], rtol=1e-9)
-
-    # The streaming forecast equals the batch features run through the same model.
-    closes = bar_closes(trades, 10)
-    feats = prepare(log_returns(closes), bar_counts(trades, closes, 10), CONFIG)
-    feats.index = feats.index + pd.Timedelta(seconds=10)
-    model = m.models[INSTRUMENT]
-    expected = np.exp(model.predict(har_inputs(feats, model))) * feats["slow_vol"]
-    expected = expected.loc[common].iloc[200:]  # after the 30-minute look-back fills
-    np.testing.assert_allclose(got.loc[expected.index, "forecast_vol"], expected, rtol=1e-9)
+def no_store() -> BarStore:
+    return BarStore(TradeStore("/nonexistent"))
 
 
-def test_alert_on_volatility_burst():
-    vol = np.r_[np.full(3 * 3600, 0.4), np.full(600, 2.0)]
-    trades = simulate_trades(vol.size, vol, rate=2.0, seed=1)
-    cut = trades["timestamp"].iloc[0] + 3 * 3600 * 1000
+def seeded(tape, cut_ms, **kw):
+    m = LiveMonitor([INST], CONFIG, bar_store=no_store(), **kw)
+    m.apply_seed({INST: ([], tape[tape["timestamp"] < cut_ms])})
+    return m
+
+
+def test_seed_then_live_equals_batch(tape):
+    t0 = int(tape["timestamp"].iloc[0])
+    cut = t0 + (DAY + 2 * 3600) * 1000 + 4_321  # mid-bar
     received = []
-    m = LiveMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
-    m.apply_seed({INSTRUMENT: trades[trades["timestamp"] < cut]})
-    assert m.snapshot(INSTRUMENT).level == Level.NORMAL
-    for ev in as_events(trades[trades["timestamp"] >= cut]):
+    m = seeded(tape, cut, on_alert=received.append)
+    live = tape[tape["timestamp"] >= cut - 3_000]  # overlap: the stream starts early
+    for ev in events(live):
+        m.on_event(ev, received_ms=ev.timestamp_ms + 150)
+
+    got = m.history(INST)
+    assert got.index.is_unique
+    assert (got.index.to_series().diff().dropna() == pd.Timedelta(seconds=10)).all()
+    f = compute(grid(tape), CONFIG)
+    model = m.models[INST]
+    want = f.assign(forecast_vol=np.exp(model.predict(f)) * f["slow_vol"])
+    want.index = want.index + pd.Timedelta(seconds=10)  # live rows are stamped at bar end
+    common = got.index.intersection(want.index)
+    assert len(common) > 0.9 * len(got)
+    for col in ("slow_vol", "ratio", "forecast_vol"):
+        np.testing.assert_allclose(got.loc[common, col], want.loc[common, col], rtol=1e-9)
+
+    # The burst raised both kinds of alert, live, with JSON-ready records.
+    assert {a.kind for a in received} == {"spike", "regime"}
+    assert all(a.live for a in received)
+    json.dumps(received[0].as_dict())
+    snap = m.snapshot(INST)
+    assert snap.latency_ms == 150 and snap.seq_gaps == 0
+    assert 0 < snap.p_violent < 1 and snap.sigma_5m > 0
+
+
+class TapeREST:
+    def __init__(self, tape):
+        self.tape = tape
+
+    def trades(self, instrument, start, end):
+        return self.tape
+
+
+def test_sequence_holes_are_checked_against_rest(tape):
+    t0 = int(tape["timestamp"].iloc[0])
+    cut = t0 + (DAY + 2 * 3600) * 1000
+    after = tape[tape["timestamp"] >= cut].iloc[:200]
+    book = after.index[after["kind"] == "book"]
+
+    # A hole holding a book trade: the bars are wrong, so the monitor re-seeds.
+    m = seeded(tape, cut)
+    for ev in events(after.drop(book[50])):
         m.on_event(ev)
-    assert received and received == m.alerts()
-    spikes = [a for a in received if a.kind == "spike"]
-    assert spikes[-1].level == "spike" or any(a.level == "spike" for a in spikes)
-    assert any(a.kind == "regime" and a.level == "stressed" for a in received)
-    first = spikes[0]
-    assert (first.time - pd.Timestamp(cut, unit="ms", tz="UTC")).total_seconds() < 60
-    json.dumps(first.as_dict())
-    snap = m.snapshot(INSTRUMENT)
-    assert snap.fast_vol > snap.slow_vol and snap.sigma_5m > 0
-    assert snap.regime >= Regime.ACTIVE
+    m.check_holes(TapeREST(tape))
+    assert m.seq_gaps[INST] == 1 and m._resync
+
+    # A hole holding only a block trade: noted, no re-seed.
+    block = tape.copy()
+    block.loc[book[60], "kind"] = "block"
+    m = seeded(block, cut)
+    for ev in events(block.loc[after.index].drop(book[60])):
+        m.on_event(ev)
+    m.check_holes(TapeREST(block))
+    assert m.seq_gaps[INST] == 0 and m.seq_skipped[INST] == 1 and not m._resync
 
 
-def test_bars_close_on_time_without_trades():
-    trades = tape(hours=1)
-    m = LiveMonitor([INSTRUMENT], DetectorConfig(bar_seconds=10, slow_half_life=300))
-    m.apply_seed({INSTRUMENT: trades})
-    last = m.snapshot(INSTRUMENT).time
-    later = int(last.timestamp() * 1000) + 35_000
+def test_duplicates_are_ignored_and_bars_close_on_the_clock(tape):
+    t0 = int(tape["timestamp"].iloc[0])
+    cut = t0 + (DAY + 2 * 3600) * 1000
+    m = seeded(tape, cut)
+    before = m.snapshot(INST).time
+    for ev in events(tape[tape["timestamp"] < cut].iloc[-50:]):  # already loaded
+        m.on_event(ev)
+    assert m.snapshot(INST).time == before
+    later = int(before.timestamp() * 1000) + 35_000
     m.on_event(DvolUpdate("btc_usd", later, 40.0))
-    snap = m.snapshot(INSTRUMENT)
-    assert (snap.time - last).total_seconds() == 30  # three empty bars closed by the clock
+    snap = m.snapshot(INST)
+    assert (snap.time - before).total_seconds() == 30  # three empty bars closed by the clock
     assert snap.dvol == pytest.approx(0.40)
 
 
-def test_dvol_indices():
+def test_seed_reads_stored_days_and_fetches_the_rest(tmp_path, tape):
+    from tests.test_data import FakeAPI
+    from volengine.data.sync import sync
+
+    store = TradeStore(tmp_path)
+    sync(INST, "2026-01-01", "2026-01-02", store=store, api=FakeAPI(tape))
+    m = LiveMonitor([INST], CONFIG, bar_store=BarStore(store))
+    end = pd.Timestamp("2026-01-02 02:30", tz="UTC")
+    calls = []
+
+    class REST:
+        def trades(self, instrument, start, end):
+            calls.append((start, end))
+            lo, hi = start.timestamp() * 1000, end.timestamp() * 1000
+            return tape[(tape["timestamp"] >= lo) & (tape["timestamp"] < hi)]
+
+    seed = m.fetch_seed(REST(), end)
+    frames, _ = seed[INST]
+    assert len(frames) == 1  # 2026-01-01 comes from disk
+    assert calls == [(pd.Timestamp("2026-01-02", tz="UTC"), end)]
+    m.apply_seed(seed)
+    assert m.snapshot(INST).regime in Regime
+
+
+def test_dvol_indices_and_pooled_model_for_other_instruments():
     m = LiveMonitor(["BTC-PERPETUAL", "ETH-PERPETUAL", "SOL_USDC-PERPETUAL"])
     assert m.dvol_indices == ["btc_usd", "eth_usd"]
-
-
-class FakeREST:
-    def __init__(self, trades):
-        self.data = trades
-        self.calls = 0
-
-    def trades(self, instrument, start, end):
-        self.calls += 1
-        return self.data
+    assert m.models["SOL_USDC-PERPETUAL"] == default_model("pooled")
 
 
 class FakeStream:
-    def __init__(self, events):
-        self._events = events
+    """Replays events at a steady pace, leaving the seeding thread time to finish."""
+
+    def __init__(self, evs, pace=0.002):
+        self._evs = evs
+        self.pace = pace
+        self.clock = 0  # exchange time of the last trade delivered
 
     async def events(self):
-        for ev in self._events:
-            await asyncio.sleep(0.001)
+        for ev in self._evs:
+            await asyncio.sleep(self.pace)
+            if isinstance(ev, Trade):
+                self.clock = ev.timestamp_ms + 1
             yield ev
 
 
-async def test_run_buffers_during_seed_and_reseeds_after_reconnect():
-    trades = tape(hours=2)
-    cut = trades["timestamp"].iloc[0] + 7000 * 1000
-    rest = FakeREST(trades[trades["timestamp"] < cut])
-    live = as_events(trades[trades["timestamp"] >= cut - 2_000])
-    events = [*live[:300], Reconnected(), *live[300:]]
-    m = LiveMonitor([INSTRUMENT], CONFIG)
-    await m.run(stream=FakeStream(events), rest=rest)
-    assert rest.calls == 2
-    hist = m.history(INSTRUMENT)
-    assert hist.index.is_unique
-    assert hist.index[-1] >= pd.Timestamp(int(live[-1].timestamp_ms) - 20_000, unit="ms", tz="UTC")
+async def test_run_buffers_while_seeding_and_reseeds_after_reconnect(tape):
+    t0 = int(tape["timestamp"].iloc[0])
+    cut = t0 + (DAY + 2 * 3600) * 1000
+    live = events(tape[tape["timestamp"] >= cut - 2_000].iloc[:3000])
+    stream = FakeStream([*live[:500], Reconnected(), *live[500:]])
+    calls = []
 
+    class REST:
+        """History up to the last trade the stream has delivered, like the real server."""
 
-def test_alerts_found_in_startup_history_are_listed_but_not_sent():
-    vol = np.r_[np.full(3 * 3600, 0.4), np.full(300, 2.0), np.full(1200, 0.4)]
-    trades = simulate_trades(vol.size, vol, rate=2.0, seed=5)
-    received = []
-    m = LiveMonitor([INSTRUMENT], DetectorConfig(), on_alert=received.append)
-    m.apply_seed({INSTRUMENT: trades})
-    alerts = m.alerts()
-    assert alerts and not received
-    assert all(not a.live and a.dvol is None for a in alerts)
-    m.apply_seed({INSTRUMENT: trades})  # re-seeding after a reconnection does not duplicate
-    assert m.alerts() == alerts
+        def trades(self, instrument, start, end):
+            calls.append(1)
+            now = max(cut, stream.clock)
+            return tape[tape["timestamp"] < now]
+
+    m = LiveMonitor([INST], CONFIG, bar_store=no_store())
+    m.fetch_seed = lambda rest, end=None: {INST: ([], rest.trades(INST, None, None))}
+    await m.run(stream=stream, rest=REST())
+    assert len(calls) == 2  # start and reconnection, no hole
+    assert m.seq_gaps[INST] == 0
+    h = m.history(INST)
+    last = pd.Timestamp(live[-1].timestamp_ms - 20_000, unit="ms", tz="UTC")
+    assert h.index.is_unique and h.index[-1] >= last

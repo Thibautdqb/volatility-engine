@@ -1,8 +1,10 @@
 """Command-line interface.
 
-volengine live BTC-PERPETUAL ETH-PERPETUAL --log alerts.jsonl
-volengine study BTC-PERPETUAL --end 2026-10-28
-volengine fit BTC-PERPETUAL ETH-PERPETUAL --days 44 --out models.json
+volengine data sync --start 2026-04-28          download and verify the trade tape
+volengine data status                           what is stored, and is it complete
+volengine backtest BTC-PERPETUAL                walk-forward evaluation
+volengine fit --days 90 --out models.json       coefficients for the live monitor
+volengine live --log alerts.jsonl               real-time monitor
 """
 
 from __future__ import annotations
@@ -17,16 +19,16 @@ import pandas as pd
 
 from volengine.detector import DetectorConfig
 
+INSTRUMENTS = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+_COLORS = {0: "", 1: "\x1b[33m", 2: "\x1b[1;31m"}
 _RESET = "\x1b[0m"
 
 
-def _pct(x: float | None, digits: int = 1, sign: bool = False) -> str:
-    if x is None or pd.isna(x):
-        return "n/a"
-    return f"{100 * x:{'+' if sign else ''}.{digits}f}%"
+def _pct(x, digits: int = 1) -> str:
+    return "n/a" if x is None or pd.isna(x) else f"{100 * x:.{digits}f}%"
 
 
-def _bp(x: float | None) -> str:
+def _bp(x) -> str:
     return "n/a" if x is None or pd.isna(x) else f"{1e4 * x:+.1f}bp"
 
 
@@ -41,15 +43,96 @@ def _price(x: float) -> str:
     return f"{x:,.2f}" if x < 1000 else f"{x:,.1f}"
 
 
-def _config(args) -> DetectorConfig:
-    return DetectorConfig(
-        bar_seconds=args.bar,
-        fast_half_life=args.fast,
-        slow_half_life=args.slow,
-        elevated=args.elevated,
-        spike=args.spike,
-        reset=args.reset,
-    )
+def _today() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC").floor("D")
+
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+
+def cmd_sync(args) -> None:
+    from volengine.data.sync import sync
+
+    end = args.end or _today()
+    for inst in args.instruments:
+        result = sync(
+            inst,
+            args.start,
+            end,
+            workers=args.workers,
+            refresh=args.refresh,
+            on_day=lambda d, n, i=inst: print(f"  {i} {d:%Y-%m-%d}: {n:,} trades", flush=True),
+        )
+        print(result.summary())
+
+
+def cmd_status(args) -> None:
+    from volengine.data.store import TradeStore
+
+    store = TradeStore()
+    print(f"store: {store.root}\n")
+    for inst in args.instruments:
+        s = store.status(inst)
+        if s.empty:
+            print(f"{inst}: nothing stored\n")
+            continue
+        holes = int((s["gap_before"].fillna(0) != 0).sum())
+        span = pd.date_range(s.index[0], s.index[-1], freq="D")
+        print(
+            f"{inst}: {len(s)} days, {s.index[0]:%Y-%m-%d} to {s.index[-1]:%Y-%m-%d} "
+            f"({len(span) - len(s)} days absent in between)\n"
+            f"  {s['trades'].sum():,} trades: {s['book'].sum():,} book, "
+            f"{s['block'].sum():,} block, {s['combo'].sum():,} combo\n"
+            f"  missing sequence numbers inside days: {int(s['missing'].sum())}, "
+            f"duplicates: {int(s['duplicates'].sum())}, holes across midnight: {holes}\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# backtest and fit
+# ---------------------------------------------------------------------------
+
+
+def _features(instrument: str, start, end, config: DetectorConfig) -> pd.DataFrame:
+    from volengine.data.bars import load_bars
+    from volengine.features import compute
+
+    return compute(load_bars(instrument, start, end, config.bar_seconds), config)
+
+
+def cmd_backtest(args) -> None:
+    from volengine.evaluation import WalkForwardConfig, evaluate
+
+    config = DetectorConfig()
+    feats = _features(args.instrument, args.start, args.end or _today(), config)
+    wf = WalkForwardConfig(args.step, args.min_train, args.max_train)
+    report = evaluate(feats, config, wf=wf, instrument=args.instrument, n_boot=args.boot)
+    print(report.summary())
+    if args.out:
+        report.wf.windows.to_parquet(args.out)
+        print(f"\nout-of-sample windows written to {args.out}")
+
+
+def cmd_fit(args) -> None:
+    from volengine.forecast import fit
+
+    config = DetectorConfig()
+    end = pd.Timestamp(args.end, tz="UTC") if args.end else _today()
+    start = end - pd.Timedelta(days=args.days)
+    feats = {i: _features(i, start, end, config) for i in args.instruments}
+    models = {i: fit(f, config, instrument=i).to_dict() for i, f in feats.items()}
+    if len(feats) > 1:  # one model on all instruments, for instruments without their own
+        pooled = fit(list(feats.values()), config, instrument="pooled")
+        models["pooled"] = pooled.to_dict()
+    text = json.dumps(models, indent=1)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(text + "\n")
+    for name, m in models.items():
+        coefs = ", ".join(f"{k} {v:+.3f}" for k, v in m["coefs"].items())
+        print(f"{name} ({m['trained_on']}, {m['n']} windows): {coefs}")
 
 
 # ---------------------------------------------------------------------------
@@ -57,29 +140,21 @@ def _config(args) -> DetectorConfig:
 # ---------------------------------------------------------------------------
 
 
-def _severity(regime, level) -> int:
-    """0 = plain, 1 = yellow, 2 = red: the worse of the forecast and the spike detector."""
-    from volengine.forecast import Regime
-
-    r = {Regime.ACTIVE: 1, Regime.STRESSED: 2}.get(regime, 0)
-    return max(r, int(level))
-
-
 def _load_models(path: str | None):
     if not path:
         return None
-    from volengine.forecast import HARModel
+    from volengine.forecast import Model
 
     with open(path) as f:
-        return {k: HARModel.from_dict(v) for k, v in json.load(f).items()}
+        return {k: Model.from_dict(v) for k, v in json.load(f).items()}
 
 
 def cmd_live(args) -> None:
+    from volengine.forecast import Regime
     from volengine.live import Alert, LiveMonitor
 
     color = sys.stdout.isatty() and not args.no_color
     log_file = open(args.log, "a", buffering=1) if args.log else None
-    colors = {0: "", 1: "\x1b[33m", 2: "\x1b[1;31m"}
 
     def on_alert(a: Alert) -> None:
         if log_file is not None:
@@ -87,13 +162,17 @@ def cmd_live(args) -> None:
         if args.bell:
             sys.stdout.write("\a")
 
-    config = _config(args)
+    config = DetectorConfig()
     monitor = LiveMonitor(
         args.instruments, config, on_alert=on_alert, models=_load_models(args.models)
     )
 
     def paint(text: str, severity: int) -> str:
-        return f"{colors[severity]}{text}{_RESET}" if color and severity else text
+        return f"{_COLORS[severity]}{text}{_RESET}" if color and severity else text
+
+    def severity(s) -> int:
+        r = {Regime.ACTIVE: 1, Regime.STRESSED: 2}.get(s.regime, 0)
+        return max(r, int(s.level))
 
     def render(m: LiveMonitor) -> None:
         snaps = m.snapshots()
@@ -105,6 +184,7 @@ def cmd_live(args) -> None:
                 "price": _price(s.price),
                 "regime": s.regime.name,
                 "for": _duration((s.time - s.regime_since).total_seconds()),
+                "P(violent)": _pct(s.p_violent),
                 "next 5m vol": _pct(s.forecast_vol),
                 "vs normal": f"{s.forecast_ratio:.2f}x",
                 "1sd 5m": _price(s.sigma_5m),
@@ -117,14 +197,15 @@ def cmd_live(args) -> None:
             for s in snaps
         ]
         table = pd.DataFrame(rows).to_string(index=False).splitlines()
-        lines = [table[0]] + [
-            paint(t, _severity(s.regime, s.level)) for t, s in zip(table[1:], snaps, strict=True)
-        ]
+        lines = [table[0]] + [paint(t, severity(s)) for t, s in zip(table[1:], snaps, strict=True)]
         stamp = max(s.time for s in snaps).strftime("%H:%M:%S")
+        health = "  ".join(
+            f"{s.instrument.split('-')[0]} latency "
+            f"{'n/a' if s.latency_ms is None else f'{s.latency_ms:.0f}ms'}, seq holes {s.seq_gaps}"
+            for s in snaps
+        )
         out = [
-            f"{stamp} UTC | regime = forecast of the next 5 minutes | "
-            f"spike = vol 1m vs normal (30m): elevated >= {config.elevated:g}x, "
-            f"spike >= {config.spike:g}x",
+            f"{stamp} UTC | forecast of the next 5 minutes; violent = vol >= 2x normal | {health}",
             "",
             *lines,
         ]
@@ -136,10 +217,9 @@ def cmd_live(args) -> None:
                 out.append(
                     paint(
                         f"{a.time:%H:%M:%S}  {a.instrument:<14} {a.kind:<6} "
-                        f"{a.previous:>8} -> {a.level:<8}  "
+                        f"{a.previous:>8} -> {a.level:<8}  P(violent) {_pct(a.p_violent):>6}  "
                         f"next 5m {_pct(a.forecast_vol):>6} ({a.forecast_ratio:.2f}x)  "
-                        f"vol 1m {_pct(a.fast_vol):>6} ({a.ratio:.2f}x)  "
-                        f"move 1m {_bp(a.move_1m):>7}  @ {_price(a.price)}"
+                        f"vol 1m {a.ratio:.2f}x  move 1m {_bp(a.move_1m):>7}  @ {_price(a.price)}"
                         + ("" if a.live else "  (history)"),
                         sev,
                     )
@@ -147,7 +227,7 @@ def cmd_live(args) -> None:
         sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(out) + "\n")
         sys.stdout.flush()
 
-    print(f"connecting and loading the last {monitor.seed_span} of trades...")
+    print(f"connecting and loading the last {monitor.seed_span} of bars...")
     try:
         asyncio.run(monitor.run(on_bar=render))
     except KeyboardInterrupt:
@@ -158,100 +238,55 @@ def cmd_live(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# study and fit
-# ---------------------------------------------------------------------------
-
-
-def cmd_study(args) -> None:
-    from volengine.study import run_forecast_study, run_study
-
-    config = _config(args)
-    fc = run_forecast_study(
-        args.instrument,
-        train_days=args.train_days,
-        test_days=args.days,
-        end=args.end,
-        config=config,
-        violent=args.violent,
-    )
-    print("FIVE-MINUTE FORECAST AND REGIMES\n")
-    print(fc.summary())
-    spike = run_study(
-        args.instrument,
-        days=args.days,
-        end=args.end,
-        config=config,
-        horizon_minutes=args.horizon,
-        violent=args.violent,
-    )
-    print("\n\nSPIKE DETECTOR (same test period)\n")
-    print(spike.summary())
-
-
-def cmd_fit(args) -> None:
-    from volengine.study import fit_model
-
-    models = {
-        i: fit_model(i, days=args.days, end=args.end, config=_config(args)).to_dict()
-        for i in args.instruments
-    }
-    text = json.dumps(models, indent=2)
-    if args.out:
-        with open(args.out, "w") as f:
-            f.write(text + "\n")
-    print(text)
-
-
-# ---------------------------------------------------------------------------
-
-
-def _add_detector_args(p: argparse.ArgumentParser) -> None:
-    d = DetectorConfig()
-    g = p.add_argument_group("detector")
-    g.add_argument("--bar", type=float, default=d.bar_seconds, help="bar length, seconds")
-    g.add_argument("--fast", type=float, default=d.fast_half_life, help="fast half-life, seconds")
-    g.add_argument("--slow", type=float, default=d.slow_half_life, help="slow half-life, seconds")
-    g.add_argument("--elevated", type=float, default=d.elevated, help="elevated ratio threshold")
-    g.add_argument("--spike", type=float, default=d.spike, help="spike ratio threshold")
-    g.add_argument("--reset", type=float, default=d.reset, help="ratio below which it resets")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="volengine",
-        description="Five-minute volatility forecast, regimes and spike alerts for Deribit.",
+        description="Five-minute volatility forecast and regimes for Deribit perpetuals.",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
 
-    live = sub.add_parser("live", help="forecast, regime and spike alerts in real time")
-    live.add_argument("instruments", nargs="*", default=["BTC-PERPETUAL", "ETH-PERPETUAL"])
-    live.add_argument("--log", help="append alerts to this file, one JSON object per line")
-    live.add_argument("--bell", action="store_true", help="ring the terminal bell on alerts")
-    live.add_argument("--models", help="JSON file of HAR coefficients from 'volengine fit'")
-    live.add_argument("--show-alerts", type=int, default=10, help="alerts listed under the table")
-    live.add_argument("--no-color", action="store_true")
-    _add_detector_args(live)
-    live.set_defaults(func=cmd_live)
+    data = sub.add_parser("data", help="local store of the trade tape")
+    dsub = data.add_subparsers(dest="data_command", required=True)
+    s = dsub.add_parser("sync", help="download, verify and repair complete UTC days")
+    s.add_argument("instruments", nargs="*", default=INSTRUMENTS)
+    s.add_argument("--start", required=True, help="first day, e.g. 2026-04-28")
+    s.add_argument("--end", default=None, help="day after the last one (default: today)")
+    s.add_argument("--workers", type=int, default=4)
+    s.add_argument("--refresh", action="store_true", help="download stored days again")
+    s.set_defaults(func=cmd_sync)
+    st = dsub.add_parser("status", help="stored days and their integrity")
+    st.add_argument("instruments", nargs="*", default=INSTRUMENTS)
+    st.set_defaults(func=cmd_status)
 
-    study = sub.add_parser("study", help="fit on past trades, score on the days that follow")
-    study.add_argument("instrument", nargs="?", default="BTC-PERPETUAL")
-    study.add_argument("--days", type=int, default=14, help="test days (complete UTC days)")
-    study.add_argument("--train-days", type=int, default=30, help="training days before them")
-    study.add_argument("--end", default=None, help="last day excluded (default: today)")
-    study.add_argument("--horizon", type=int, default=5, help="spike evaluation window, minutes")
-    study.add_argument("--violent", type=float, default=2.0, help="forward/normal vol ratio")
-    _add_detector_args(study)
-    study.set_defaults(func=cmd_study)
+    bt = sub.add_parser("backtest", help="walk-forward out-of-sample evaluation")
+    bt.add_argument("instrument", nargs="?", default="BTC-PERPETUAL")
+    bt.add_argument("--start", default="2026-04-28")
+    bt.add_argument("--end", default=None, help="day after the last one (default: today)")
+    bt.add_argument("--step", type=int, default=7, help="days between refits")
+    bt.add_argument("--min-train", type=int, default=28, help="days before the first test")
+    bt.add_argument("--max-train", type=int, default=90, help="longest training window, days")
+    bt.add_argument("--boot", type=int, default=1000, help="bootstrap replications")
+    bt.add_argument("--out", help="write the out-of-sample windows to this Parquet file")
+    bt.set_defaults(func=cmd_backtest)
 
-    fit = sub.add_parser("fit", help="estimate the HAR coefficients on past trades")
-    fit.add_argument("instruments", nargs="*", default=["BTC-PERPETUAL", "ETH-PERPETUAL"])
-    fit.add_argument("--days", type=int, default=44, help="complete UTC days to fit on")
-    fit.add_argument("--end", default=None, help="last day excluded (default: today)")
-    fit.add_argument("--out", help="write the coefficients to this JSON file")
-    _add_detector_args(fit)
-    fit.set_defaults(func=cmd_fit)
+    ft = sub.add_parser("fit", help="fit the forecast on the most recent stored days")
+    ft.add_argument("instruments", nargs="*", default=INSTRUMENTS)
+    ft.add_argument("--days", type=int, default=90)
+    ft.add_argument("--end", default=None, help="day after the last one (default: today)")
+    ft.add_argument("--out", help="write the models to this JSON file")
+    ft.set_defaults(func=cmd_fit)
 
+    lv = sub.add_parser("live", help="forecast, regime and alerts in real time")
+    lv.add_argument("instruments", nargs="*", default=INSTRUMENTS)
+    lv.add_argument("--log", help="append alerts to this file, one JSON object per line")
+    lv.add_argument("--bell", action="store_true", help="ring the terminal bell on alerts")
+    lv.add_argument("--models", help="JSON file written by 'volengine fit'")
+    lv.add_argument("--show-alerts", type=int, default=10, help="alerts listed under the table")
+    lv.add_argument("--no-color", action="store_true")
+    lv.set_defaults(func=cmd_live)
     return p
 
 
