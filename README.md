@@ -4,244 +4,265 @@
 ![python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Real-time five-minute volatility forecast and market-regime classifier for BTC and ETH perpetuals on Deribit, with a short-term spike detector.
+How violent will the next five minutes be? A forecast of short-term volatility for BTC and ETH perpetuals on Deribit, updated every 10 seconds from the live trade feed and evaluated week by week on five months of data it was never fitted on.
 
-Every 10 seconds, from the live trade feed (WebSocket), the monitor answers two questions:
+For each instrument, the monitor gives:
 
-- **How much will the market move over the next 5 minutes?** It gives a volatility forecast, the matching one-standard-deviation price move, and a regime: `CALM`, `NORMAL`, `ACTIVE` or `STRESSED`.
-- **Is something happening right now?** The spike detector compares the volatility of the last minute with the normal level.
+- **P(violent)**: the probability that the next five minutes move at least twice the normal volatility. The average is about 3%.
+- **A regime**: `CALM`, `NORMAL`, `ACTIVE` or `STRESSED`.
+- **The size of the expected move**: forecast volatility, and the one-standard-deviation price move over five minutes in USD.
+- **Alerts**: when the regime enters `STRESSED`, and when a spike is happening now.
 
-Everything is fitted on past trades and checked on days the model has never seen. Direction was tested as well: no signal was found that predicts it (see [What does not work](#what-does-not-work)). Only Deribit's public API is used, so no account or key is needed.
+It does not forecast direction. That was tested, and no tradable directional signal was found (see [What does not work](#what-does-not-work)).
 
 ```
-10:33:40 UTC | regime = forecast of the next 5 minutes | spike = vol 1m vs normal (30m): elevated >= 2x, spike >= 3x
+12:11:00 UTC | forecast of the next 5 minutes; violent = vol >= 2x normal | BTC latency 273ms, seq holes 0  ETH latency 98ms, seq holes 0
 
-                 price regime    for next 5m vol vs normal 1sd 5m  spike vol 1m normal move 1m  dvol
-BTC-PERPETUAL 81,451.0 NORMAL 22m00s       21.4%     0.86x  53.65 NORMAL  27.2%  24.9%  +2.2bp 37.1%
-ETH-PERPETUAL  2,367.8 NORMAL  0m30s       23.9%     0.77x   1.74 NORMAL  27.3%  31.1%  +1.5bp 52.5%
-
-alerts
-10:07:00  ETH-PERPETUAL  regime   normal -> stressed  next 5m  40.5% (1.14x)  vol 1m  65.2% (1.84x)  move 1m -10.3bp  @ 2,367.8  (history)
-08:35:40  ETH-PERPETUAL  spike    normal -> elevated  next 5m  84.5% (1.46x)  vol 1m 158.7% (2.74x)  move 1m +38.1bp  @ 2,379.8  (history)
-08:35:40  BTC-PERPETUAL  spike    normal -> elevated  next 5m  45.4% (1.46x)  vol 1m  72.2% (2.33x)  move 1m +18.3bp  @ 81,547.5  (history)
+                 price regime    for P(violent) next 5m vol vs normal 1sd 5m  spike vol 1m normal move 1m  dvol
+BTC-PERPETUAL 80,033.0 ACTIVE 10m40s       4.5%       23.1%     1.07x  57.08 NORMAL  19.6%  21.7%  -3.4bp 36.4%
+ETH-PERPETUAL  2,320.2 ACTIVE  0m20s       6.1%       31.1%     1.08x   2.22 NORMAL  25.9%  28.9%  -5.8bp 51.9%
 ```
 
 ![Example](docs/img/example.png)
 
-*One out-of-sample example, chosen because it is easy to read: the model was fitted on September only and is drawn here on 2026-10-14.*
+*2026-10-14. The model is the one the walk-forward used that week, fitted on 2026-07-16 to 2026-10-13 only.*
 
-- The forecast (blue) sits in `ACTIVE` and `STRESSED` from 12:00, after a first burst of activity.
-- It is back in `STRESSED` at 12:28. US data are released at 12:30 UTC, and the time-of-day term knows that this slot is usually volatile.
-- At 12:30, BTC falls 0.9% in 30 seconds, and the realized volatility of the next five minutes reaches 10× normal. The spike detector (red dots) fires only once the move has happened.
-- After the shock, the forecast decays faster than the one-minute volatility, and the regime leaves `STRESSED` at 12:38.
+- It is in `STRESSED` without interruption from 12:22:30. Scheduled US data come out at 12:30 UTC, and the time-of-day term knows that this slot is usually volatile.
+- At 12:30, BTC falls 0.9% in 30 seconds and the next five minutes run at 10× normal volatility. The spike detector (red dots) fires only once the move has happened.
+- The regime returns to `ACTIVE` at 12:38.
 
-The statistics below are what to judge the model on.
+This is one illustration. The evidence is the statistics below.
 
 ---
 
-## Results (out of sample)
+## Results
 
-Data: every Deribit trade over 44 days, 11.1 million on BTC and 4.2 million on ETH, cut in two periods:
+Walk-forward over 2026-05-27 to 2026-10-27, for BTC and ETH separately:
 
-- **Sep**: 2026-09-14 to 2026-10-13;
-- **Oct**: 2026-10-14 to 2026-10-27.
+- **Refits.** Every week, the model is refitted on the previous 28 to 90 days and forecasts every 10-second bar of the following week, as it would have live.
+- **Sample.** That gives 22 weeks and about 44,000 non-overlapping five-minute windows per asset, all out of sample.
+- **Inference.** Standard errors are HAC with a one-hour window. Intervals come from a stationary block bootstrap with one-hour blocks.
 
-The model is fitted on one period and scored on the other, in both directions. Scored windows are non-overlapping five-minute windows. Intervals are 95%, from a stationary block bootstrap with one-hour blocks.
+The complete output is in [`docs/results/`](docs/results), and `python scripts/make_figures.py` regenerates it.
 
-### Accuracy of the five-minute forecast
+### Accuracy
 
-Out-of-sample R² of log(realized vol over the next 5 minutes / normal vol):
+Target: log(realized volatility over the next five minutes / normal volatility), where *normal* is a 30-minute EWMA.
 
-| forecast | BTC, tested on Oct | BTC, tested on Sep | ETH, tested on Oct | ETH, tested on Sep |
+| forecast | BTC R² | DM t vs model | ETH R² | DM t vs model |
 |---|---:|---:|---:|---:|
-| unchanged normal level | −0.12 | −0.12 | −0.13 | −0.14 |
-| volatility of the last 5 minutes | −0.18 | −0.23 | −0.13 | −0.24 |
-| volatility of the last minute (spike detector) | −0.26 | −0.28 | −0.18 | −0.29 |
-| **model** | **+0.17** | **+0.14** | **+0.17** | **+0.13** |
-| MSE reduction vs last 5 minutes, 95% CI | [0.040, 0.056] | [0.056, 0.073] | [0.035, 0.047] | [0.058, 0.072] |
-| Mincer-Zarnowitz slope (1 = unbiased scale) | 0.97 | 0.93 | 0.97 | 0.90 |
+| **model** | **0.107** | | **0.129** | |
+| training-period mean | 0 | −22.5 | 0 | −26.4 |
+| volatility of the last 30 minutes | −0.072 | −29.6 | −0.093 | −36.2 |
+| volatility of the last 5 minutes | −0.357 | −30.6 | −0.297 | −46.3 |
+| volatility of the last minute (spike detector) | −0.366 | −43.0 | −0.390 | −53.7 |
 
-- Over five minutes, simply carrying forward the recent volatility is worse than assuming the normal level, because short-term volatility mean-reverts quickly.
-- The model explains 13 to 17% of the variance of log volatility, which is a good result for a noisy five-minute target.
-- The Mincer-Zarnowitz slope stays close to 1 out of sample: the forecasts have the right scale, without over- or under-reaction.
+- **Significance.** The model has a lower loss than every simple alternative, with Diebold-Mariano t-statistics between −22 and −54.
+- **Every week.** Its R² is positive in **22 of 22 weeks** on both assets: the minimum is 0.062 on BTC and 0.086 on ETH.
+- **Scale.** The Mincer-Zarnowitz slope is 1.01 (HAC se 0.02) on both assets, so the forecasts have the right scale.
 
-### Regimes
+![Weekly R²](docs/img/weekly.png)
 
-![Regimes](docs/img/regimes.png)
+### Does it anticipate?
 
-Share of five-minute windows that turn out *violent* (realized vol at least 2× normal), by the regime shown at the start of the window:
+**Discrimination of P(violent)** (AUC; 0.5 = no information):
 
-| regime | share of time | realized vol / normal (median) | P(violent), BTC | P(violent), ETH | spike detector not firing |
+| | BTC | ETH |
+|---|---:|---:|
+| all windows | 0.662 [0.643, 0.679] | 0.696 [0.682, 0.711] |
+| windows where the spike detector is quiet | **0.625** [0.605, 0.643] | **0.661** [0.646, 0.678] |
+| spike detector alone | 0.653 | 0.673 |
+
+The second row is the anticipation test: before anything unusual shows in the last minute, the probability still ranks the coming windows well above chance.
+
+**Lead time.** A violent episode starts at a five-minute window whose realized volatility reaches 2× normal after a window that did not. Episodes closer than 30 minutes are merged, which leaves 963 on BTC and 1,004 on ETH. The table gives the share of episodes for which each signal was already on, *L* minutes before the episode began:
+
+| minutes before | BTC: `STRESSED` | BTC: spike detector | ETH: `STRESSED` | ETH: spike detector |
+|---:|---:|---:|---:|---:|
+| 0 | 18.1% | 7.3% | 20.6% | 7.2% |
+| 2 | 14.8% | 3.6% | 18.4% | 3.8% |
+| 5 | 12.7% | 4.0% | 14.1% | 2.8% |
+| 10 | 6.0% | 1.9% | 8.2% | 2.3% |
+| share of all time the signal is on | 7.0% | 3.9% | 7.9% | 3.9% |
+
+![Anticipation](docs/img/anticipation.png)
+
+- **A real warning window.** `STRESSED` is on about 7% of the time but already covers 13–21% of episodes in the five minutes before they start, 1.8 to 2.6 times its base rate. The spike detector stays close to its own base rate until the episode starts, as expected from a coincident signal.
+- **About 5 minutes, not 15.** Ten minutes out, the warning is back to its base rate.
+- **Most episodes come unannounced.** Four out of five start while the regime is not `STRESSED`. Those moves come from a single print (a release, a liquidation) that the past five minutes did not foreshadow.
+
+### Calibration and regimes
+
+![Calibration](docs/img/calibration.png) ![Regimes](docs/img/regimes.png)
+
+- **Calibration.** The probability is calibrated within its confidence intervals up to about 10%. Above that it is slightly low: forecasts of 13% come true 16–17% of the time, and forecasts of 28–29% come true 31–37% of the time. The Brier skill against the training-period base rate is +0.026 on BTC and +0.034 on ETH.
+- **Regimes.** They order the risk monotonically:
+
+| regime | share of time (BTC / ETH) | next 5m vol / normal, median | P(violent) BTC | P(violent) ETH | spike detector quiet |
 |---|---:|---:|---:|---:|---:|
-| `CALM` | 13–20% | 0.69–0.74 | 0.5–1.2% | 0.8–1.2% | 100% |
-| `NORMAL` | 48–52% | 0.82–0.84 | 1.3–1.5% | 1.3–1.4% | 100% |
-| `ACTIVE` | 25–27% | 0.95–0.98 | 1.9–2.1% | 2.4–3.5% | 96–99% |
-| `STRESSED` | 6.5–8% | 1.17–1.27 | **11.8–12.7%** | **12.3–12.5%** | **64–68%** |
+| `CALM` | 16% / 17% | 0.70 / 0.68 | 1.7% | 1.2% | 100% |
+| `NORMAL` | 52% / 50% | 0.81 / 0.81 | 1.8% | 1.9% | 99% |
+| `ACTIVE` | 25% / 26% | 0.95 / 0.94 | 3.2% | 3.6% | 94–96% |
+| `STRESSED` | 7% / 7% | 1.19 / 1.16 | **10.6%** [9.4, 11.7] | **10.7%** [9.6, 11.8] | 69–70% |
 
-Ranges cover the two test directions. The full tables with intervals are printed by `volengine study`.
+### Does it generalize?
 
-- A violent five minutes is 8 to 10 times more likely in `STRESSED` than in `NORMAL`, and 10 to 25 times more likely than in `CALM`, for both assets and in both directions. The intervals do not overlap.
-- Two thirds of the `STRESSED` windows begin while the spike detector is still quiet. The regime is a warning ahead of the move, not a restatement of it.
-- `CALM` windows are genuinely quiet, at 0.7× normal. For a market maker or a stop placement, that is as useful as the warning.
+`python scripts/research.py` reproduces the tables in this section.
+
+| walk-forward R² | BTC | ETH |
+|---|---:|---:|
+| fitted on its own history | 0.107 | 0.129 |
+| fitted on the *other* asset only | 0.101 | 0.118 |
+| fitted on both | 0.107 | 0.126 |
+
+- **Across assets.** A model fitted on ETH forecasts BTC almost as well as BTC's own, and the other way round. The relationship is not specific to one asset. Instruments without their own model get the model fitted on both assets.
+- **Across time.**
+  - The R² is positive in every one of the 22 test weeks.
+  - Longer training windows help on both assets: R² is 0.116, 0.121 and 0.123 on BTC, and 0.134, 0.140 and 0.143 on ETH, with windows of 28, 56 and 90 days. The relationship is stable rather than drifting.
+  - Across the 22 weekly refits, the coefficients barely move. On BTC: `x30` 0.26 ± 0.02, `x5` 0.14 ± 0.01, time of day 0.83 ± 0.02, weekend −0.09 ± 0.02 (mean ± standard deviation).
 
 ### What does not work
 
-`scripts/feature_search.py` reproduces the full search.
+`scripts/research.py` reproduces both points.
 
-- **More inputs for volatility.** Order-flow imbalance, liquidation volume and the perpetual-index basis add nothing out of sample beyond the six terms used.
-- **Direction.** Several candidates were tested for predicting the sign of the next 1, 5 and 15 minutes:
-  - trade imbalance over the last minute;
+- **More inputs.** Inputs were selected on May–July only, with a rule fixed in advance: keep an input group if it raises the walk-forward R² by at least 0.002, on average over BTC and ETH.
+  - The groups kept: 4-hour and 1-day volatility, and the weekend flag, each worth +0.004 to +0.005.
+  - The groups rejected: order-flow imbalance and liquidation volume, worth +0.0007 each.
+  - On August–October, seen once at the end, the chosen set beats the base set on both assets: R² 0.122 against 0.118 on BTC, and 0.143 against 0.132 on ETH.
+- **Direction.** Four candidate signals were tested against the next 1, 5 and 15 minutes' return:
+  - order-flow imbalance over the last minute;
   - the last move;
-  - Deribit's spot index moving before the perpetual;
-  - changes in the basis.
+  - the perpetual's premium over the spot index;
+  - the index moving first.
 
-  Every Spearman correlation is below 0.05 in absolute value, and a third of them change sign between periods. The most stable pattern is a mild reversal over 15 minutes after a large one-minute move. Fading moves beyond 2 standard deviations earns 1.5 to 3 bp on average. That is not significant (t-statistics between 0.9 and 1.4) and is below the 10 bp round-trip taker fee. **This tool tells you how much the market is likely to move, not which way.**
+  One effect is stable: order-flow imbalance continues over the next minute. Its rank correlation is 0.01–0.08, and following the top and bottom deciles earns 0.1 to 1.0 bp per minute (t between 2.6 and 17). That is far below the ≈10 bp round trip of a taker, and it shrinks from May–July to August–October. **The tool tells you how much the market is likely to move, not which way.**
 
-### Spike detector
+---
 
-The detector flags a move as it happens, so it is coincident by design. When it is flagged, the next five minutes are violent 6 to 10 times more often than when it is not; the 95% intervals start at 4 in every period and asset. After an alert, the excess volatility halves in about 10 minutes:
+## Data engineering
 
-![After a spike alert](docs/img/after_alert.png)
-
-## Dashboard
-
-`streamlit run dashboard/app.py` shows the same monitor with charts, refreshed every second:
-
-- price, with spike alerts as red dots;
-- forecast, realized and normal volatility;
-- `ACTIVE` and `STRESSED` periods shaded;
-- the alert list.
-
-![Dashboard](docs/img/dashboard.png)
-
-## What each column means
-
-| column | meaning | use |
-|---|---|---|
-| `regime` | forecast class for the next 5 minutes; rises at once, falls after one minute below its threshold | size, spreads, pausing a strategy |
-| `for` | time in the current regime | |
-| `next 5m vol` | forecast volatility over the next 5 minutes, annualized | |
-| `vs normal` | the same divided by the 30-minute normal volatility | unit-free; the regime cut points are on this scale |
-| `1sd 5m` | one-standard-deviation price move over the next 5 minutes, in USD | stop distance, quote width |
-| `spike` | `NORMAL`, `ELEVATED` (vol 1m ≥ 2× normal) or `SPIKE` (≥ 3×) | something is happening now |
-| `vol 1m`, `normal` | realized volatility, EWMA half-lives of 1 and 30 minutes, annualized | |
-| `move 1m` | price change over the last minute, in bp | the direction of what just happened |
-| `dvol` | Deribit's 30-day implied volatility index | context from the options market |
-
-Alerts are raised when the regime enters `STRESSED` (it re-arms once back to `NORMAL` or `CALM`) and when the spike detector escalates. With `--log`, they are written one JSON object per line:
-
-```json
-{"time": "2026-10-28T10:07:00+00:00", "instrument": "ETH-PERPETUAL", "kind": "regime", "previous": "normal", "level": "stressed", "forecast_ratio": 1.139505, "forecast_vol": 0.405181, "ratio": 1.83287, "fast_vol": 0.651725, "slow_vol": 0.355576, "price": 2367.8, "move_1m": -0.001034, "dvol": null, "live": false}
+```
+Deribit history server ──(REST, paginated, 8 req/s cap, retries)──► per-day download
+        │                                                                │
+        │                        check trade_seq contiguity, re-download around holes
+        ▼                                                                ▼
+WebSocket trades.{instrument}.100ms           Parquet store: trades/v1/<instrument>/<day>.parquet
+        │                                     + manifest <day>.json (counts, seq range, holes)
+        ▼                                                                │
+ sequence check ─► 10-second bars ◄────── same rules ─────── 10-second bars (cached per day)
+        │                                                                │
+        ▼                                                                ▼
+   live monitor  ◄─── seeded from stored days + REST for today      backtest / fit
 ```
 
-- **History alerts.** Alerts found in the four hours of trades loaded at start-up are listed with the mark `(history)` so the list matches the charts, but they are not written to the log.
-- **The record above.** It is one of those, which is why `live` is false and `dvol` is null. A live alert carries the current DVOL.
+- **Completeness can be proven.** Deribit numbers each instrument's trades with a `trade_seq` that increases by exactly one. A day is complete when its sequence numbers are contiguous and the first one follows the previous day's last.
+  - Holes are re-downloaded. A hole that cannot be filled stays flagged in the day's manifest; it is never ignored silently.
+  - The stored sample holds 34.7 million trades over 184 days: 0 missing sequence numbers, 0 duplicates, 0 holes across midnight (`volengine data status`).
+- **Only book trades make prices.** Block trades (negotiated off-book) and combo legs (priced by the spread) are stored and flagged but excluded from the bars. Over the sample they number 3,018 and 29,595 on BTC.
+- **One definition of a bar, live and historical.** The last trade in sequence order sets a bar's price, and a print stamped in a bar that has already closed is ignored. The streaming and batch implementations are tested to give identical bars, inputs and forecasts, to 1e-9.
+- **Safe writes, incremental runs.**
+  - Every file is written to a temporary name and renamed, so an interrupted run never leaves a truncated file.
+  - Only complete UTC days are stored, and a sync downloads only what is missing.
+  - Bar caches rebuild themselves when their source day changes.
+- **The live feed is checked too.**
+  - A jump in `trade_seq` triggers a lookup of the missing trades on the history server. If one of them was a book trade, the monitor re-seeds; block or combo trades alone are noted and skipped.
+  - Latency from exchange timestamp to receipt is shown, typically 100–300 ms.
+  - Bars close on exchange time even without trades (the DVOL feed ticks twice a second).
+- **Fast start.** The monitor needs 26 hours of history: the detector's warm-up plus the 1-day input. Stored days are read from disk; the rest is downloaded in parallel 2-hour slices, about 25 seconds for a full day of BTC.
+
+## The model
+
+Every input is known at the close of the bar and expressed relative to normal volatility, so it is unit-free across assets and calendar periods. Least squares on non-overlapping five-minute windows:
+
+| input | definition | BTC coefficient (shipped) |
+|---|---|---:|
+| `x1`, `x5`, `x30`, `x4h`, `x1d` | ½ log(realized variance over the last 1 m, 5 m, 30 m, 4 h, 1 d / normal variance) | +0.02, +0.19, +0.24, +0.09, +0.02 |
+| `season` | usual log volatility of the coming 5-minute slot of the day, from the training days | +0.79 |
+| `trades` | log(trades in the last minute / average per minute over 30 minutes) | +0.05 |
+| `absmove` | \|price change over the last minute\| in normal standard deviations | +0.04 |
+| `weekend` | 1 on Saturday and Sunday (UTC) | −0.08 |
+
+- **Volatility terms.** The first five form a heterogeneous autoregression (Corsi, 2009) moved to intraday horizons.
+- **Probability.** P(violent) comes from a logistic regression of the event on the forecast and its square, fitted on the same training windows. The curve is constrained never to decrease as the forecast rises.
+- **Regimes.** The cut points are the 25th, 75th and 95th percentiles of the training forecasts. A regime rises as soon as a cut point is crossed and falls back only after one minute below it. That hysteresis cuts the number of regime changes from 33–39 to 15–17 per hour.
+- **Shipped coefficients.** `src/volengine/models.json` holds models fitted on the last 90 days for BTC, ETH, and both together. `volengine fit` re-estimates them from the local store.
 
 ## Usage
 
 ```bash
 git clone https://github.com/Thibautdqb/volatility-engine.git
 cd volatility-engine
-pip install -e ".[dashboard]"     # core only: pip install -e .
+pip install -e ".[dashboard]"
 ```
 
 ```bash
-volengine live                                   # BTC and ETH
+volengine live                                   # BTC and ETH, works without a local store
 volengine live BTC-PERPETUAL --log alerts.jsonl --bell
 streamlit run dashboard/app.py
-volengine study ETH-PERPETUAL --end 2026-10-28   # fit on 30 days, score on the next 14
-volengine fit --days 44 --out models.json        # re-estimate; use with live --models
+
+volengine data sync --start 2026-04-28           # download and verify (about 30 min for 6 months)
+volengine data status
+volengine backtest ETH-PERPETUAL --end 2026-10-28
+volengine fit --days 90 --out models.json        # then: volengine live --models models.json
 ```
 
-- **Start-up.** The monitor downloads the last four hours of trades (about 5 seconds), so that the normal volatility and the forecast are warm from the first bar.
-- **Cache.** `volengine study` and `volengine fit` cache downloaded days in `~/.cache/volengine`. The first download of 44 days takes 15 to 30 minutes; later runs take seconds.
+The store lives in `~/.cache/volengine`; set `VOLENGINE_DATA` to move it. Alerts are written one JSON object per line. The record below was found in the history loaded at start-up, hence `live: false` and no DVOL:
 
-From Python:
-
-```python
-from volengine.live import LiveMonitor
-
-monitor = LiveMonitor(["BTC-PERPETUAL"], on_alert=lambda a: print(a.as_dict()))
-monitor.start_background()  # or: await monitor.run()
-monitor.snapshot("BTC-PERPETUAL")  # Snapshot(regime=..., forecast_vol=..., sigma_5m=..., ...)
+```json
+{"time": "2026-10-29T11:12:30+00:00", "instrument": "ETH-PERPETUAL", "kind": "regime", "previous": "active", "level": "stressed", "forecast_ratio": 1.178156, "forecast_vol": 0.373374, "p_violent": 0.095419, "ratio": 1.919503, "fast_vol": 0.608318, "slow_vol": 0.316914, "price": 2321.7, "move_1m": -0.001377, "dvol": null, "live": false}
 ```
 
-## The model
-
-Bars are 10 seconds long. *Normal* is an EWMA of squared returns with a 30-minute half-life. The forecast is ordinary least squares on non-overlapping five-minute windows:
-
-```
-log(vol next 5m / normal) = c + b1·x1 + b5·x5 + b30·x30 + bs·season + bt·trades + bm·absmove
-```
-
-| term | definition | BTC coefficient (shipped) |
-|---|---|---:|
-| `x1`, `x5`, `x30` | log(realized vol over the last 1, 5, 30 min / normal) | −0.004, +0.200, +0.167 |
-| `season` | log volatility of the coming 5-minute slot of the day relative to the daily average, from the training days | +0.806 |
-| `trades` | log(trades in the last minute / average per minute over 30 minutes) | +0.067 |
-| `absmove` | \|price change over the last minute\| in normal standard deviations | +0.061 |
-
-- **The terms.** The first three are the HAR model of Corsi (2009) moved to intraday horizons; the 5- and 30-minute volatilities carry most of the information. The time-of-day term captures the US open and scheduled releases. Each added term improves the out-of-sample R² in all four tests (`scripts/feature_search.py`).
-- **The regimes.** Cut points are the 25th, 75th and 95th percentiles of the forecast on the training data. On BTC, a forecast below 0.78× normal is `CALM` and one above 1.15× is `STRESSED`.
-- **Shipped coefficients.** The coefficients in `src/volengine/models.json` are fitted on all 44 days. ETH's are within 0.03 of BTC's. The out-of-sample results above use models fitted on one period only.
-
-## How it is built
-
-- **Data.** Live bars come from the `trades.{instrument}.100ms` WebSocket channel; measured latency from exchange timestamp to receipt is 150 to 190 ms median and about 330 ms at the 95th percentile. Historical bars come from the same trades on `history.deribit.com`. A bar's price is its last trade, and a bar without a trade keeps the previous price.
-- **One code path.** The streaming and batch implementations of the sampler, the detector and the forecast are tested to give identical numbers, to 1e-9. The figures above are therefore exactly what the live monitor would have shown.
-- **Start-up and reconnection.** The monitor subscribes first and buffers, then downloads recent history and runs the models over it. It then replays the buffered trades that the download missed, matching them by trade id. After a disconnection it does the same again, so the gap is filled with real trades.
-- **Clock.** Bars close on exchange time even when no trade prints: the DVOL feed ticks twice a second and closes any bar that ended more than a second earlier.
+![Dashboard](docs/img/dashboard.png)
 
 ## Statistical design
 
-- **No look-ahead.** Every input is known at the close of the bar, and the target uses only later returns. The time-of-day profile and the regime cut points come from the training period only.
-- **Both directions.** Each model is scored on a period it was not fitted on, forward in time and backward. The four results agree.
-- **Dependence.** Neighbouring windows are not independent, so intervals use the stationary bootstrap (Politis & Romano, 1994) with one-hour blocks.
-- **Market closures.** Five-minute windows without any price change at all (about 40 per instrument in 44 days) are dropped from fitting and scoring.
-- **Checks under the null** (in `tests/`):
-  - With constant volatility, the forecast has no skill (R² < 0.02), and the spike detector raises no alert with Gaussian returns.
-  - With independent jumps, alerts fire but predict nothing.
-  - On simulated volatility clusters, the forecast beats the naive ones.
+- **No look-ahead.** Every input is known at the close of its bar, and the target uses only later returns. The training window of every refit ends before its test week begins; a test enforces this.
+- **Everything is estimated on the training window.** That covers the coefficients, the time-of-day profile, the probability calibration and the regime cut points.
+- **Selection and confirmation are separate.** Inputs were chosen on May–July with a rule fixed in advance; August–October and the second asset confirm.
+- **Dependence.** Neighbouring windows are not independent, hence HAC errors and block-bootstrap intervals. The Diebold-Mariano test's size under dependent losses is checked by simulation in the test suite.
+- **Market closures.** Five-minute windows without any price change are dropped from fitting and scoring.
+- **Null checks** (in `tests/`). With fat-tailed returns but no volatility memory, the forecast has no skill (R² < 0.02, AUC ≈ 0.5). With volatility clusters, it beats the naive forecasts.
 
 ## Limitations
 
-- **44 days.** Both periods belong to one market environment. The time-of-day profile in particular should be re-estimated regularly with `volengine fit`.
-- **Trade prices, not quotes.** Deribit publishes no historical order book, so both the study and the monitor use trades to stay identical.
-- **The first jump.** A third of the `STRESSED` windows only start once the spike detector is already firing. A move that comes out of nowhere is still seen only when it happens.
-- **Not a trading signal by itself.** The model forecasts the size of moves, not their direction.
+- **Six months, two assets, one venue.** The models are re-estimated weekly in the backtest; live, `volengine fit` should be rerun regularly.
+- **The first jump.** Four out of five violent episodes are not announced. The model shifts the odds; it does not see releases or liquidations coming.
+- **The probability is slightly low in the tail.** Above 10%, it is low by a few points.
+- **Trade prices, not quotes.** Deribit publishes no historical order book, so both the backtest and the monitor use trades to stay identical.
 
 ## Project layout
 
 ```
 src/volengine/
-  forecast.py     five-minute forecast, regimes (batch and streaming)
-  detector.py     spike detector: fast/slow EWMA ratio with hysteresis
-  sampling.py     trades -> 10-second bars (batch and streaming, identical)
-  live.py         live monitor: seeding, buffering, alerts, snapshots
-  study.py        out-of-sample evaluation, model fitting, trade cache
-  stats.py        stationary bootstrap, Wilson interval
-  models.json     shipped coefficients
-  deribit/        REST trade history and WebSocket stream (heartbeat, reconnect)
+  data/           schema and integrity checks, Parquet store, sync and repair, bars
+  deribit/        REST client (rate cap, retries, parallel slices), WebSocket stream
+  features.py     forecast inputs, batch and streaming
+  forecast.py     model, probability, regimes, streaming forecaster
+  detector.py     spike detector: 1-minute vs 30-minute EWMA with hysteresis
+  evaluation.py   walk-forward, accuracy, calibration, regimes, anticipation
+  stats.py        HAC, Diebold-Mariano, stationary bootstrap, AUC, Wilson
+  live.py         live monitor: seeding, sequence checks, alerts
   cli.py
-dashboard/app.py  Streamlit front-end
-scripts/          figures, feature search
-tests/            unit tests + integration tests against Deribit (pytest -m network)
+dashboard/app.py
+scripts/          research.py (modelling decisions), make_figures.py (results)
+docs/results/     full backtest output per instrument
+tests/            unit tests; integration tests against Deribit with -m network
 ```
 
 ```bash
 pip install -e ".[dev]"
-pytest -m "not network"
-pytest -m network
+pytest -m "not network" && pytest -m network
 ruff check . && ruff format --check .
 ```
 
 ## References
 
-- Andersen, Bollerslev, Diebold & Labys (2000). Great realizations. *Risk*.
+- Andersen, Bollerslev, Diebold & Labys (2003). Modeling and forecasting realized volatility. *Econometrica*.
 - Corsi (2009). A simple approximate long-memory model of realized volatility. *Journal of Financial Econometrics*.
+- Diebold & Mariano (1995). Comparing predictive accuracy. *JBES*.
 - Mincer & Zarnowitz (1969). The evaluation of economic forecasts. *NBER*.
+- Newey & West (1987). A simple, positive semi-definite, heteroskedasticity and autocorrelation consistent covariance matrix. *Econometrica*.
 - Politis & Romano (1994). The stationary bootstrap. *JASA*.
-- J.P. Morgan / Reuters (1996). *RiskMetrics Technical Document*.
 
 ## License
 

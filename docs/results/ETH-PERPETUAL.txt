@@ -1,0 +1,45 @@
+ETH-PERPETUAL: 22 weekly folds, 44,113 out-of-sample windows, 2026-05-27 to 2026-10-27
+inputs: x1, x5, x30, x4h, x1d, season, trades, absmove, weekend
+
+accuracy of log(vol next 5m / normal), pooled; DM < 0 favours the forecast
+                            R2   MSE  DM t (forecast vs this)     p
+forecast                                                           
+forecast                 0.129 0.166                      NaN   NaN
+training mean            0.000 0.190                  -26.429 0.000
+last 5 minutes          -0.297 0.247                  -46.275 0.000
+last 30 minutes         -0.093 0.208                  -36.214 0.000
+spike detector (vol 1m) -0.390 0.264                  -53.740 0.000
+weekly R2: min 0.086, median 0.127, positive in 22 of 22 weeks; beats 'last 5 minutes' in 22 of 22
+Mincer-Zarnowitz slope 1.010 (HAC se 0.015)
+
+P(violent next 5m), violent = vol >= 2x normal, base rate 2.86%
+  AUC 0.696 [0.682, 0.711]   spike detector alone 0.673
+  AUC while the spike detector is quiet 0.661 [0.646, 0.678]
+  Brier skill vs training base rate +0.034
+                    n  mean forecast  observed  ci low  ci high
+bin                                                            
+(-0.001, 0.01]   2228          0.008     0.010   0.007    0.015
+(0.01, 0.02]    14736          0.015     0.014   0.012    0.016
+(0.02, 0.05]    22091          0.030     0.026   0.024    0.028
+(0.05, 0.1]      4147          0.065     0.068   0.061    0.076
+(0.1, 0.2]        745          0.131     0.157   0.133    0.185
+(0.2, 1.0]        166          0.282     0.367   0.298    0.443
+
+regimes
+          share of time  realized / normal (median)  P(violent)  ci low  ci high  spike detector quiet
+regime                                                                                                
+CALM              0.168                       0.681       0.012   0.010    0.015                 1.000
+NORMAL            0.497                       0.810       0.019   0.017    0.021                 0.996
+ACTIVE            0.261                       0.942       0.036   0.033    0.039                 0.955
+STRESSED          0.074                       1.155       0.107   0.096    0.118                 0.689
+
+anticipation: share of violent episodes already signalled, by lead time
+                episodes  forecast STRESSED  spike detector on
+minutes before                                                
+0                   1004              0.206              0.072
+1                   1004              0.186              0.046
+2                   1004              0.184              0.038
+5                   1004              0.141              0.028
+10                  1004              0.082              0.023
+15                  1004              0.076              0.022
+  share of all time signalled: forecast STRESSED 7.9%, spike detector 3.9%
