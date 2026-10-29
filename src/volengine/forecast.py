@@ -35,6 +35,7 @@ from volengine.features import StreamingFeatures, windows
 SLOT_SECONDS = 300
 SLOTS = 86_400 // SLOT_SECONDS
 REGIME_QUANTILES = (0.25, 0.75, 0.95)
+STRESS_GRID = np.r_[np.linspace(0, 95, 96), np.linspace(95.1, 100, 50)]  # finer at the top
 VIOLENT = 2.0  # "violent": realized vol over the next five minutes >= 2 x normal
 DEFAULT_FEATURES = ("x1", "x5", "x30", "x4h", "x1d", "season", "trades", "absmove", "weekend")
 
@@ -73,6 +74,46 @@ class RegimeTracker:
         return self.regime
 
 
+class StressAlarm:
+    """One alert when stress first reaches ``threshold`` (or a spike is under way), then
+    quiet until the market calms down.
+
+    The alarm re-arms once stress has fallen back below ``rearm`` (the NORMAL band) and
+    at least ``gap_seconds`` have passed since the last alert, so one agitated episode
+    gives one alert rather than a burst.
+    """
+
+    def __init__(
+        self,
+        threshold: float = 99.0,
+        rearm: float = 75.0,
+        gap_seconds: float = 1800.0,
+        spikes: bool = True,
+    ):
+        if not 0 < rearm < threshold <= 100:
+            raise ValueError("need 0 < rearm < threshold <= 100")
+        self.threshold = threshold
+        self.spikes = spikes  # a move already under way (spike detector at SPIKE) also alerts
+        self.rearm = rearm
+        self.gap = gap_seconds
+        self.armed = True
+        self.last: float | None = None
+
+    def update(self, stress: float, t_seconds: float, spike: bool = False) -> str | None:
+        """Returns the reason for an alert ("forecast" or "spike"), or None."""
+        reason = "forecast" if stress >= self.threshold else None
+        if reason is None and self.spikes and spike:
+            reason, stress = "spike", 100.0
+        if stress < self.rearm:
+            self.armed = True
+        if reason is None or not self.armed:
+            return None
+        if self.last is not None and t_seconds - self.last < self.gap:
+            return None
+        self.armed, self.last = False, t_seconds
+        return reason
+
+
 def track_regimes(ratios: np.ndarray, cuts, hold: int = 6) -> np.ndarray:
     tracker = RegimeTracker(cuts, hold)
     return np.array([int(tracker.update(float(x))) for x in ratios], dtype=int)
@@ -100,6 +141,9 @@ class Model:
     season: tuple[float, ...] = field(default=(0.0,) * SLOTS, repr=False)
     logit: tuple[float, float, float] = (-3.5, 3.0, 0.0)  # P(violent) on 1, f, f^2
     cuts: tuple[float, float, float] = (0.8, 0.95, 1.1)  # forecast ratios between regimes
+    levels: tuple[float, ...] = field(  # training log forecasts at the STRESS_GRID percentiles
+        default=tuple(np.linspace(-1.0, 1.0, STRESS_GRID.size)), repr=False
+    )
     instrument: str = ""
     trained_on: str = ""
     n: int = 0
@@ -141,6 +185,13 @@ class Model:
     def regime(self, ratio: float) -> Regime:
         return classify(ratio, self.cuts)
 
+    def stress(self, log_forecast) -> np.ndarray:
+        """Stress score, 0 to 100: percentile of the forecast among the training forecasts.
+
+        95 and above is the top 5%, the STRESSED regime.
+        """
+        return np.interp(np.asarray(log_forecast, dtype=float), self.levels, STRESS_GRID)
+
     # -- persistence -------------------------------------------------------
 
     def to_dict(self) -> dict:
@@ -159,6 +210,7 @@ class Model:
             season=tuple(d.pop("season")),
             logit=tuple(d.pop("logit")),
             cuts=tuple(d.pop("cuts")),
+            levels=tuple(d.pop("levels")),
             **d,
         )
 
@@ -192,6 +244,7 @@ def fit(
         season=tuple(round(float(s), 5) for s in draft.season),
         logit=tuple(round(float(v), 5) for v in logit),
         cuts=tuple(round(float(c), 4) for c in np.exp(np.quantile(fitted, REGIME_QUANTILES))),
+        levels=tuple(round(float(q), 5) for q in np.quantile(fitted, STRESS_GRID / 100)),
         instrument=instrument,
         trained_on=f"{w.index[0]:%Y-%m-%d} to {w.index[-1]:%Y-%m-%d}",
         n=len(w),
@@ -247,6 +300,7 @@ class Forecast:
     ratio: float  # forecast vol over the next 5 minutes / normal vol
     vol: float  # the same, annualized
     p_violent: float  # P(vol next 5 minutes >= 2 x normal)
+    stress: float  # 0-100, percentile among the training forecasts
     regime: Regime
 
 
@@ -269,4 +323,5 @@ class StreamingForecaster:
         ratio = math.exp(log_f)
         vol = ratio * math.sqrt(slow_var * self.config.bars_per_year)
         p = float(self.model.p_violent(log_f))
-        return Forecast(ratio, vol, p, self.tracker.update(ratio))
+        stress = float(self.model.stress(log_f))
+        return Forecast(ratio, vol, p, stress, self.tracker.update(ratio))

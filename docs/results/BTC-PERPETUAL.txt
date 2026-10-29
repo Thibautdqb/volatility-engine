@@ -43,3 +43,12 @@ minutes before
 10                   963              0.060              0.019
 15                   963              0.056              0.023
   share of all time signalled: forecast STRESSED 7.0%, spike detector 3.9%
+
+stress alarm: stress >= threshold or spike under way; one alert per episode,
+re-armed when stress falls below 75, at least 30 minutes apart;
+precision = a violent 5-minute window starts within 10 minutes of the alert
+           alerts per day  precision  base  next 5m vol / normal (median)  episodes caught  quiet detector
+threshold                                                                                                 
+98.0                7.305      0.305 0.093                          1.369            0.331           0.362
+99.0                5.318      0.348 0.093                          1.514            0.293           0.252
+99.5                4.299      0.370 0.093                          1.585            0.248           0.165

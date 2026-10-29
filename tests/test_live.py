@@ -84,7 +84,7 @@ def events(df):
 
 @pytest.fixture(scope="module")
 def tape():
-    vol = np.r_[np.full(DAY + 3 * 3600, 0.4), np.full(600, 2.0), np.full(3600, 0.5)]
+    vol = np.r_[np.full(DAY + 3 * 3600, 0.4), np.full(600, 3.2), np.full(3600, 0.5)]
     return simulate_trades(vol.size, vol, rate=1.0, seed=1, block_share=0.01)
 
 
@@ -119,13 +119,17 @@ def test_seed_then_live_equals_batch(tape):
     for col in ("slow_vol", "ratio", "forecast_vol"):
         np.testing.assert_allclose(got.loc[common, col], want.loc[common, col], rtol=1e-9)
 
-    # The burst raised both kinds of alert, live, with JSON-ready records.
-    assert {a.kind for a in received} == {"spike", "regime"}
-    assert all(a.live for a in received)
-    json.dumps(received[0].as_dict())
+    # The burst raised exactly one alert, live, as it started, with a readable message.
+    burst = t0 + (DAY + 3 * 3600) * 1000
+    assert len(received) == 1 and received[0].live
+    alert = received[0]
+    assert 0 <= (alert.time.timestamp() * 1000 - burst) < 120_000
+    assert alert.stress >= 99 or alert.reason == "spike"
+    assert alert.instrument in alert.title and "P(violent)" in alert.body
+    json.dumps(alert.as_dict())
     snap = m.snapshot(INST)
     assert snap.latency_ms == 150 and snap.seq_gaps == 0
-    assert 0 < snap.p_violent < 1 and snap.sigma_5m > 0
+    assert 0 < snap.p_violent < 1 and snap.sigma_5m > 0 and 0 <= snap.stress <= 100
 
 
 class TapeREST:

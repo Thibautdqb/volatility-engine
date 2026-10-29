@@ -4,7 +4,8 @@ volengine data sync --start 2026-04-28          download and verify the trade ta
 volengine data status                           what is stored, and is it complete
 volengine backtest BTC-PERPETUAL                walk-forward evaluation
 volengine fit --days 90 --out models.json       coefficients for the live monitor
-volengine live --log alerts.jsonl               real-time monitor
+volengine watch --notify ntfy:my-topic          alerts only, to a phone
+volengine live                                  full real-time table
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 
 import pandas as pd
 
@@ -149,7 +151,62 @@ def _load_models(path: str | None):
         return {k: Model.from_dict(v) for k, v in json.load(f).items()}
 
 
+def _monitor(args, on_alert):
+    from volengine.live import LiveMonitor
+
+    return LiveMonitor(
+        args.instruments,
+        DetectorConfig(),
+        on_alert=on_alert,
+        models=_load_models(args.models),
+        threshold=args.threshold,
+        spikes=not args.no_spike,
+    )
+
+
+def cmd_watch(args) -> None:
+    """Quiet mode: one line of status now and then, and the alerts."""
+    from volengine.live import Alert, LiveMonitor
+    from volengine.notify import Notifier
+
+    notifier = Notifier(args.notify or ["terminal"])
+    if args.test:
+        notifier.send({"test": True}, "volengine: test alert", "If you can read this, alerts work.")
+        print(f"test alert sent to: {', '.join(notifier.targets)}")
+        return
+
+    def on_alert(a: Alert) -> None:
+        notifier.send(a.as_dict(), a.title, a.body)
+
+    monitor = _monitor(args, on_alert)
+    last_status = [0.0]
+
+    def status(m: LiveMonitor) -> None:
+        snaps = m.snapshots()
+        if not snaps or time.monotonic() - last_status[0] < 60 * args.status:
+            return
+        last_status[0] = time.monotonic()
+        parts = [
+            f"{s.instrument.split('-')[0]} stress {s.stress:4.1f} ({s.regime.name.lower()})"
+            for s in snaps
+        ]
+        stamp = max(s.time for s in snaps).strftime("%H:%M")
+        print(f"[{stamp} UTC] " + "  ".join(parts), flush=True)
+
+    print(
+        f"watching {', '.join(args.instruments)}: alert when stress >= {args.threshold:g}"
+        f"{'' if args.no_spike else ' or a spike is under way'}; "
+        f"notify: {', '.join(notifier.targets)}",
+        flush=True,
+    )
+    try:
+        asyncio.run(monitor.run(on_bar=status))
+    except KeyboardInterrupt:
+        pass
+
+
 def cmd_live(args) -> None:
+    """Full table, refreshed on every bar."""
     from volengine.forecast import Regime
     from volengine.live import Alert, LiveMonitor
 
@@ -162,17 +219,13 @@ def cmd_live(args) -> None:
         if args.bell:
             sys.stdout.write("\a")
 
-    config = DetectorConfig()
-    monitor = LiveMonitor(
-        args.instruments, config, on_alert=on_alert, models=_load_models(args.models)
-    )
+    monitor = _monitor(args, on_alert)
 
     def paint(text: str, severity: int) -> str:
         return f"{_COLORS[severity]}{text}{_RESET}" if color and severity else text
 
     def severity(s) -> int:
-        r = {Regime.ACTIVE: 1, Regime.STRESSED: 2}.get(s.regime, 0)
-        return max(r, int(s.level))
+        return {Regime.ACTIVE: 1, Regime.STRESSED: 2}.get(s.regime, 0)
 
     def render(m: LiveMonitor) -> None:
         snaps = m.snapshots()
@@ -182,13 +235,13 @@ def cmd_live(args) -> None:
             {
                 "": s.instrument,
                 "price": _price(s.price),
+                "stress": f"{s.stress:.1f}",
                 "regime": s.regime.name,
                 "for": _duration((s.time - s.regime_since).total_seconds()),
                 "P(violent)": _pct(s.p_violent),
                 "next 5m vol": _pct(s.forecast_vol),
                 "vs normal": f"{s.forecast_ratio:.2f}x",
                 "1sd 5m": _price(s.sigma_5m),
-                "spike": s.level.name,
                 "vol 1m": _pct(s.fast_vol),
                 "normal": _pct(s.slow_vol),
                 "move 1m": _bp(s.move_1m),
@@ -205,7 +258,8 @@ def cmd_live(args) -> None:
             for s in snaps
         )
         out = [
-            f"{stamp} UTC | forecast of the next 5 minutes; violent = vol >= 2x normal | {health}",
+            f"{stamp} UTC | stress 0-100 = rank of the 5-minute volatility forecast; "
+            f"alert at {args.threshold:g} | {health}",
             "",
             *lines,
         ]
@@ -213,17 +267,8 @@ def cmd_live(args) -> None:
         if alerts:
             out += ["", "alerts"]
             for a in reversed(alerts):
-                sev = 2 if a.level in ("stressed", "spike") else 1
-                out.append(
-                    paint(
-                        f"{a.time:%H:%M:%S}  {a.instrument:<14} {a.kind:<6} "
-                        f"{a.previous:>8} -> {a.level:<8}  P(violent) {_pct(a.p_violent):>6}  "
-                        f"next 5m {_pct(a.forecast_vol):>6} ({a.forecast_ratio:.2f}x)  "
-                        f"vol 1m {a.ratio:.2f}x  move 1m {_bp(a.move_1m):>7}  @ {_price(a.price)}"
-                        + ("" if a.live else "  (history)"),
-                        sev,
-                    )
-                )
+                tag = "" if a.live else "  (history)"
+                out.append(paint(f"{a.title}{tag}\n  {a.body}", 2))
         sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(out) + "\n")
         sys.stdout.flush()
 
@@ -243,7 +288,7 @@ def cmd_live(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="volengine",
-        description="Five-minute volatility forecast and regimes for Deribit perpetuals.",
+        description="Volatility-stress indicator and alerts for Deribit perpetuals.",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
@@ -279,12 +324,34 @@ def build_parser() -> argparse.ArgumentParser:
     ft.add_argument("--out", help="write the models to this JSON file")
     ft.set_defaults(func=cmd_fit)
 
-    lv = sub.add_parser("live", help="forecast, regime and alerts in real time")
-    lv.add_argument("instruments", nargs="*", default=INSTRUMENTS)
+    def alarm_args(q: argparse.ArgumentParser) -> None:
+        q.add_argument("instruments", nargs="*", default=INSTRUMENTS)
+        q.add_argument(
+            "--threshold",
+            type=float,
+            default=99.0,
+            help="stress (0-100) that triggers an alert; 99 gives 4-6 alerts a day per asset",
+        )
+        q.add_argument("--no-spike", action="store_true", help="do not alert on spikes")
+        q.add_argument("--models", help="JSON file written by 'volengine fit'")
+
+    wt = sub.add_parser("watch", help="send an alert when volatility starts to pick up")
+    alarm_args(wt)
+    wt.add_argument(
+        "--notify",
+        action="append",
+        metavar="TARGET",
+        help="terminal, bell, desktop, ntfy:<topic>, webhook:<url>, file:<path>; repeatable",
+    )
+    wt.add_argument("--status", type=float, default=15, help="minutes between status lines")
+    wt.add_argument("--test", action="store_true", help="send a test alert and exit")
+    wt.set_defaults(func=cmd_watch)
+
+    lv = sub.add_parser("live", help="full table of stress, forecast and alerts")
+    alarm_args(lv)
     lv.add_argument("--log", help="append alerts to this file, one JSON object per line")
     lv.add_argument("--bell", action="store_true", help="ring the terminal bell on alerts")
-    lv.add_argument("--models", help="JSON file written by 'volengine fit'")
-    lv.add_argument("--show-alerts", type=int, default=10, help="alerts listed under the table")
+    lv.add_argument("--show-alerts", type=int, default=5, help="alerts listed under the table")
     lv.add_argument("--no-color", action="store_true")
     lv.set_defaults(func=cmd_live)
     return p

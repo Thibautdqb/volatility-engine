@@ -4,34 +4,49 @@
 ![python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-How violent will the next five minutes be? A forecast of short-term volatility for BTC and ETH perpetuals on Deribit, updated every 10 seconds from the live trade feed and evaluated week by week on five months of data it was never fitted on.
+A volatility-stress indicator for BTC and ETH perpetuals on Deribit. It sends one alert when the market starts to move, to a terminal, a desktop, a phone (ntfy) or a Discord or Slack webhook.
 
-For each instrument, the monitor gives:
+- **The score.** Every 10 seconds, from the live trade feed, each instrument gets a **stress score from 0 to 100**. The score is the rank of the forecast volatility of the next five minutes among the forecasts seen in training.
+- **The alert.** An alert is sent when stress reaches 99, or when a spike is already under way. It is sent once per episode, and the alarm re-arms only after stress has fallen back below 75 and at least 30 minutes have passed.
+- **What it does not do.** It does not say which way the market will go (see [What does not work](#what-does-not-work)).
 
-- **P(violent)**: the probability that the next five minutes move at least twice the normal volatility. The average is about 3%.
-- **A regime**: `CALM`, `NORMAL`, `ACTIVE` or `STRESSED`.
-- **The size of the expected move**: forecast volatility, and the one-standard-deviation price move over five minutes in USD.
-- **Alerts**: when the regime enters `STRESSED`, and when a spike is happening now.
-
-It does not forecast direction. That was tested, and no tradable directional signal was found (see [What does not work](#what-does-not-work)).
+```bash
+volengine watch --notify ntfy:<your-topic>          # phone, via the ntfy app
+volengine watch --notify desktop --notify webhook:<discord-or-slack-url>
+```
 
 ```
-12:11:00 UTC | forecast of the next 5 minutes; violent = vol >= 2x normal | BTC latency 273ms, seq holes 0  ETH latency 98ms, seq holes 0
-
-                 price regime    for P(violent) next 5m vol vs normal 1sd 5m  spike vol 1m normal move 1m  dvol
-BTC-PERPETUAL 80,033.0 ACTIVE 10m40s       4.5%       23.1%     1.07x  57.08 NORMAL  19.6%  21.7%  -3.4bp 36.4%
-ETH-PERPETUAL  2,320.2 ACTIVE  0m20s       6.1%       31.1%     1.08x   2.22 NORMAL  25.9%  28.9%  -5.8bp 51.9%
+watching BTC-PERPETUAL, ETH-PERPETUAL: alert when stress >= 99 or a spike is under way; notify: terminal
+[12:49 UTC] BTC stress 58.3 (normal)  ETH stress 59.2 (normal)
+[12:50 UTC] BTC stress 56.9 (normal)  ETH stress 57.5 (normal)
 ```
 
 ![Example](docs/img/example.png)
 
-*2026-10-14. The model is the one the walk-forward used that week, fitted on 2026-07-16 to 2026-10-13 only.*
+*2026-10-14, out of sample. The model is the one the walk-forward used that week, fitted on 2026-07-16 to 2026-10-13 only.*
 
-- It is in `STRESSED` without interruption from 12:22:30. Scheduled US data come out at 12:30 UTC, and the time-of-day term knows that this slot is usually volatile.
-- At 12:30, BTC falls 0.9% in 30 seconds and the next five minutes run at 10× normal volatility. The spike detector (red dots) fires only once the move has happened.
-- The regime returns to `ACTIVE` at 12:38.
+- Stress has been climbing since 12:00 and crosses 99 at 12:28:20, so the alert goes out then. US data are released at 12:30 UTC, and the time-of-day term knows that this slot is usually volatile.
+- At 12:30, BTC falls 0.9% in 30 seconds.
+- Stress drops back below 75 at about 12:40, which re-arms the alarm.
 
-This is one illustration. The evidence is the statistics below.
+This is one illustration. The evidence is below.
+
+## What the alerts are worth
+
+The live alarm (the same code, `StressAlarm`) was replayed bar by bar over the 22 out-of-sample weeks, May 27 to October 27, 2026.
+
+| threshold | alerts per day (BTC / ETH) | a violent 5 minutes starts within 10 min of the alert | at a random moment | episodes alerted between 10 min before and 2 min after their start |
+|---:|---:|---:|---:|---:|
+| 98 | 7.3 / 10.0 | 31% / 29% | 9% | 33% / 43% |
+| **99 (default)** | **5.3 / 7.1** | **35% / 33%** | 9% | 29% / 36% |
+| 99.5 | 4.3 / 5.4 | 37% / 37% | 9% | 25% / 30% |
+
+*Violent* means a realized volatility of at least 2× normal over the five minutes.
+
+- **What an alert means.** With the default threshold, an alert is followed by a violent five minutes 3.6 to 3.8 times as often as a random moment.
+- **What it misses.** It does not catch every episode: most violent moves start from a single print that nothing announced.
+- **Tuning.** `--threshold` trades frequency for precision, and `--no-spike` keeps only alerts that come ahead of the move.
+- **Source.** The full tables are in [`docs/results/`](docs/results).
 
 ---
 
@@ -196,8 +211,10 @@ pip install -e ".[dashboard]"
 ```
 
 ```bash
-volengine live                                   # BTC and ETH, works without a local store
-volengine live BTC-PERPETUAL --log alerts.jsonl --bell
+volengine watch                                  # alerts only; works without a local store
+volengine watch --notify desktop --notify ntfy:<topic> --notify file:alerts.jsonl
+volengine watch --test --notify ntfy:<topic>     # check delivery
+volengine live                                   # full table: stress, forecast, P(violent)
 streamlit run dashboard/app.py
 
 volengine data sync --start 2026-04-28           # download and verify (about 30 min for 6 months)
@@ -206,11 +223,10 @@ volengine backtest ETH-PERPETUAL --end 2026-10-28
 volengine fit --days 90 --out models.json        # then: volengine live --models models.json
 ```
 
-The store lives in `~/.cache/volengine`; set `VOLENGINE_DATA` to move it. Alerts are written one JSON object per line. The record below was found in the history loaded at start-up, hence `live: false` and no DVOL:
+The store lives in `~/.cache/volengine`; set `VOLENGINE_DATA` to move it.
 
-```json
-{"time": "2026-10-29T11:12:30+00:00", "instrument": "ETH-PERPETUAL", "kind": "regime", "previous": "active", "level": "stressed", "forecast_ratio": 1.178156, "forecast_vol": 0.373374, "p_violent": 0.095419, "ratio": 1.919503, "fast_vol": 0.608318, "slow_vol": 0.316914, "price": 2321.7, "move_1m": -0.001377, "dvol": null, "live": false}
-```
+- **Contents of an alert.** Each alert carries a title (instrument, stress, reason) and a line with the forecast volatility of the next five minutes, P(violent), the one-standard-deviation move in USD, the price and the move of the last minute.
+- **JSON log.** With `file:<path>`, the same fields are written as one JSON object per line: `time`, `instrument`, `reason`, `stress`, `p_violent`, `forecast_ratio`, `forecast_vol`, `sigma_5m`, `price`, `move_1m`, `ratio`, `slow_vol`, `dvol` and `live`.
 
 ![Dashboard](docs/img/dashboard.png)
 

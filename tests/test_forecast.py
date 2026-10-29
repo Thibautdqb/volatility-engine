@@ -220,3 +220,33 @@ def test_skill_with_volatility_clusters():
     assert "weekly folds" in rep.summary()
     a = anticipation(rep.wf, CONFIG)
     assert a.loc[0, "episodes"] > 0
+
+
+# -- stress and alarm -----------------------------------------------------------
+
+
+def test_stress_is_the_training_percentile():
+    m = default_model("BTC-PERPETUAL")
+    lv = np.asarray(m.levels)
+    assert np.all(np.diff(lv) >= 0)
+    assert m.stress(lv[0] - 1) == 0 and m.stress(lv[-1] + 1) == 100
+    # The STRESSED cut point sits at stress 95.
+    assert m.stress(math.log(m.cuts[2])) == pytest.approx(95, abs=0.5)
+    assert m.stress(math.log(m.cuts[0])) == pytest.approx(25, abs=0.5)
+
+
+def test_alarm_fires_once_per_episode():
+    from volengine.forecast import StressAlarm
+
+    a = StressAlarm(threshold=99, rearm=75, gap_seconds=1800)
+    seq = [(50, 0), (99.5, 10), (99.9, 20), (90, 30), (99.5, 40)]  # never calmed down
+    assert [a.update(s, t) for s, t in seq] == [None, "forecast", None, None, None]
+    assert a.update(70, 50) is None  # calm again: re-armed, but too soon
+    assert a.update(99.5, 1000) is None
+    assert a.update(60, 1900) is None
+    assert a.update(99.2, 1910) == "forecast"
+    b = StressAlarm(threshold=99)
+    assert b.update(60, 0, spike=True) == "spike"
+    assert StressAlarm(threshold=99, spikes=False).update(60, 0, spike=True) is None
+    with pytest.raises(ValueError):
+        StressAlarm(threshold=50, rearm=75)

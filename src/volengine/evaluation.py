@@ -23,8 +23,16 @@ import numpy as np
 import pandas as pd
 
 from volengine.detector import DetectorConfig, Level
-from volengine.features import windows
-from volengine.forecast import DEFAULT_FEATURES, VIOLENT, Model, Regime, fit, track_regimes
+from volengine.features import nbars, windows
+from volengine.forecast import (
+    DEFAULT_FEATURES,
+    VIOLENT,
+    Model,
+    Regime,
+    StressAlarm,
+    fit,
+    track_regimes,
+)
 from volengine.stats import (
     auc,
     bootstrap_ci,
@@ -92,6 +100,7 @@ def walk_forward(
         pred = model.predict(test)
         test["forecast"] = pred
         test["regime"] = track_regimes(np.exp(np.nan_to_num(pred)), model.cuts)
+        test["stress"] = model.stress(np.nan_to_num(pred))
         test["fold"] = k
         w = windows(test, config).dropna(subset=["forecast"]).copy()
         w["p_violent"] = model.p_violent(w["forecast"].to_numpy())
@@ -99,7 +108,7 @@ def walk_forward(
         w["clim_y"] = train_w["y"].mean()
         w["clim_p"] = float((train_w["y"] >= np.log(VIOLENT)).mean())
         out_w.append(w)
-        out_b.append(test[["forecast", "regime", "ratio", "level", "y", "close"]])
+        out_b.append(test[["forecast", "regime", "stress", "ratio", "level", "y", "close"]])
         y = w["y"].to_numpy()
         sst = np.sum((y - w["clim_y"].to_numpy()) ** 2)
         rows.append(
@@ -247,20 +256,13 @@ def anticipation(wfr: WalkForward, config: DetectorConfig, gap_minutes: int = 30
     the spike detector's is "level ELEVATED or above".
     """
     b = wfr.bars
-    w = wfr.windows
-    violent = (w["y"] >= np.log(VIOLENT)).to_numpy()
-    prev = np.r_[False, violent[:-1]]
-    onset_t = w.index[violent & ~prev]
-    kept: list[pd.Timestamp] = []
-    for t in onset_t:
-        if not kept or t - kept[-1] >= pd.Timedelta(minutes=gap_minutes):
-            kept.append(t)
+    kept = _episodes(wfr.windows, gap_minutes)
     stressed = (b["regime"] == Regime.STRESSED).astype(float)
     detector = (b["level"] >= Level.ELEVATED).astype(float)
     rows = []
     for lead in LEADS_MINUTES:
         # The window starting at t is forecast at the close of the bar starting at t.
-        at = pd.DatetimeIndex(kept) - pd.Timedelta(minutes=lead)
+        at = kept - pd.Timedelta(minutes=lead)
         s = stressed.reindex(at).dropna()
         d = detector.reindex(at).dropna()
         rows.append(
@@ -277,6 +279,75 @@ def anticipation(wfr: WalkForward, config: DetectorConfig, gap_minutes: int = 30
     return out
 
 
+ALERT_THRESHOLDS = (98.0, 99.0, 99.5)
+
+
+def _episodes(w: pd.DataFrame, gap_minutes: int = 30) -> pd.DatetimeIndex:
+    """Starts of violent episodes: a violent window after a calm one, 30 minutes apart."""
+    violent = (w["y"] >= np.log(VIOLENT)).to_numpy()
+    onset = w.index[violent & ~np.r_[False, violent[:-1]]]
+    kept: list[pd.Timestamp] = []
+    for t in onset:
+        if not kept or t - kept[-1] >= pd.Timedelta(minutes=gap_minutes):
+            kept.append(t)
+    return pd.DatetimeIndex(kept)
+
+
+def alert_study(
+    wfr: WalkForward,
+    config: DetectorConfig,
+    thresholds=ALERT_THRESHOLDS,
+    lookahead_minutes: int = 10,
+    spikes: bool = True,
+) -> pd.DataFrame:
+    """What the stress alarm would have sent, run bar by bar over the out-of-sample bars.
+
+    The alarm is the live one (:class:`StressAlarm`), with the spike detector included
+    unless ``spikes`` is False.
+
+    * precision: share of alerts followed by a violent five-minute window starting in
+      the next ``lookahead_minutes``; ``base`` is the same share at a random bar;
+    * caught: share of violent episodes with an alert between 10 minutes before and
+      2 minutes after the episode starts;
+    * quiet detector: share of alerts sent while the spike detector saw nothing yet.
+    """
+    b = wfr.bars
+    epoch = pd.Timestamp(0, tz="UTC")
+    t = np.asarray((b.index - epoch) / pd.Timedelta(seconds=1))
+    violent = pd.Series((b["y"] >= np.log(VIOLENT)).astype(float).to_numpy())
+    k = nbars(60 * lookahead_minutes, config.bar_seconds)
+    ahead = violent[::-1].rolling(k, min_periods=1).max()[::-1].shift(-1).to_numpy()
+    episodes = _episodes(wfr.windows)
+    days = (b.index[-1] - b.index[0]) / pd.Timedelta(days=1)
+    rows = []
+    for th in thresholds:
+        alarm = StressAlarm(th, spikes=spikes)
+        spike = (b["level"] >= Level.SPIKE).to_numpy()
+        fired = np.array(
+            [
+                alarm.update(s, x, k) is not None
+                for s, x, k in zip(b["stress"], t, spike, strict=True)
+            ]
+        )
+        at = b.index[fired]
+        near = [
+            ((at >= e - pd.Timedelta(minutes=10)) & (at <= e + pd.Timedelta(minutes=2))).any()
+            for e in episodes
+        ]
+        rows.append(
+            {
+                "threshold": th,
+                "alerts per day": fired.sum() / days,
+                "precision": float(np.nanmean(ahead[fired])),
+                "base": float(np.nanmean(ahead)),
+                "next 5m vol / normal (median)": float(np.exp(np.nanmedian(b["y"][fired]))),
+                "episodes caught": float(np.mean(near)),
+                "quiet detector": float((b["level"][fired] == Level.NORMAL).mean()),
+            }
+        )
+    return pd.DataFrame(rows).set_index("threshold")
+
+
 @dataclass
 class Report:
     wf: WalkForward
@@ -286,6 +357,7 @@ class Report:
     reliability: pd.DataFrame
     regimes: pd.DataFrame
     anticipation: pd.DataFrame
+    alerts: pd.DataFrame
 
     def summary(self) -> str:
         w, f = self.wf.windows, self.wf.folds
@@ -321,6 +393,11 @@ class Report:
             f"  share of all time signalled: forecast STRESSED "
             f"{a.attrs['time on: forecast STRESSED']:.1%}, spike detector "
             f"{a.attrs['time on: spike detector']:.1%}",
+            "",
+            "stress alarm: stress >= threshold or spike under way; one alert per episode,",
+            "re-armed when stress falls below 75, at least 30 minutes apart;",
+            "precision = a violent 5-minute window starts within 10 minutes of the alert",
+            self.alerts.to_string(float_format=fmt),
         ]
         return "\n".join(lines)
 
@@ -343,4 +420,5 @@ def evaluate(
         reliability=reliability(w),
         regimes=regimes(w, n_boot),
         anticipation=anticipation(r, config),
+        alerts=alert_study(r, config),
     )

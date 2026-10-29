@@ -19,7 +19,7 @@ from volengine.data.bars import load_bars
 from volengine.detector import DetectorConfig, Level
 from volengine.evaluation import Report, evaluate
 from volengine.features import compute
-from volengine.forecast import Regime
+from volengine.forecast import Regime, StressAlarm
 
 ROOT = Path(__file__).resolve().parents[1]
 IMG, RESULTS = ROOT / "docs" / "img", ROOT / "docs" / "results"
@@ -109,31 +109,39 @@ def regimes(reports: dict[str, Report]) -> None:
 
 
 def example(rep: Report, start: str, end: str) -> None:
-    b = rep.wf.bars.loc[start:end].copy()
+    """Price with the alerts the alarm sent, and the stress score, out of sample."""
+    bars = rep.wf.bars
+    alarm = StressAlarm()
+    epoch = pd.Timestamp(0, tz="UTC")
+    t = np.asarray((bars.index - epoch) / pd.Timedelta(seconds=1))
+    spike = (bars["level"] >= Level.SPIKE).to_numpy()
+    fired = [alarm.update(s, x, k) for s, x, k in zip(bars["stress"], t, spike, strict=True)]
+    bars = bars.assign(alert=fired)
+    b = bars.loc[start:end].copy()
     b.index = b.index + pd.Timedelta(seconds=CONFIG.bar_seconds)  # stamp at the bar's close
-    fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 4.6), sharex=True)
+
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 4.6), sharex=True, height_ratios=[1.2, 1])
     a1.plot(b.index, b["close"], lw=0.8)
     a1.set_ylabel("price")
-    spikes = b[b["level"] >= Level.SPIKE]
-    a1.plot(spikes.index, spikes["close"], "o", ms=2.5, color="tab:red", label="spike detector")
-    a1.legend(loc="lower left")
-    a2.plot(b.index, np.exp(b["forecast"]), lw=1.4, label="forecast, next 5 min")
-    a2.plot(b.index, np.exp(b["y"]), lw=0.8, color="grey", label="realized, next 5 min")
-    a2.set_yscale("log")
-    a2.set_yticks([0.5, 1, 2, 5, 10], ["0.5x", "1x", "2x", "5x", "10x"])
-    a2.set_ylabel("vol / normal")
-    a2.legend(loc="upper left")
-    fill = {Regime.ACTIVE: ("tab:orange", 0.12), Regime.STRESSED: ("tab:red", 0.22)}
-    run = (b["regime"] != b["regime"].shift()).cumsum()
-    for _, seg in b.groupby(run):
-        rg = Regime(int(seg["regime"].iloc[0]))
-        if rg in fill:
-            for ax in (a1, a2):
-                ax.axvspan(seg.index[0], seg.index[-1], color=fill[rg][0], alpha=fill[rg][1], lw=0)
-    a1.set_title(
-        f"{rep.wf.instrument}, {pd.Timestamp(start):%Y-%m-%d} UTC, out of sample "
-        "(orange ACTIVE, red STRESSED)"
-    )
+    a2.plot(b.index, b["stress"], lw=1.0, color="tab:purple")
+    a2.axhline(99, color="tab:red", ls=":", lw=0.9)
+    a2.text(b.index[0], 99, " alert threshold 99", va="bottom", fontsize=8, color="tab:red")
+    a2.axhline(75, color="grey", ls=":", lw=0.7)
+    a2.text(b.index[0], 75, " re-arm below 75", va="bottom", fontsize=8, color="grey")
+    a2.set_ylim(0, 102)
+    a2.set_ylabel("stress (0-100)")
+    for when, reason in b["alert"].dropna().items():
+        for ax in (a1, a2):
+            ax.axvline(when, color="tab:red", lw=1.4)
+        a1.annotate(
+            f"alert ({reason}) {when:%H:%M:%S}",
+            (when, b["close"].max()),
+            xytext=(4, -10),
+            textcoords="offset points",
+            fontsize=8,
+            color="tab:red",
+        )
+    a1.set_title(f"{rep.wf.instrument}, {pd.Timestamp(start):%Y-%m-%d} UTC, out of sample")
     fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(IMG / "example.png")

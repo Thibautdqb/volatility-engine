@@ -108,12 +108,13 @@ with st.sidebar:
     instruments = st.multiselect("Instruments", INSTRUMENTS, default=INSTRUMENTS)
     hours = st.slider("Chart window (h)", 0.5, 6.0, 2.0, 0.5)
 
-st.title("Short-term volatility monitor")
+st.title("Volatility stress")
 st.caption(
-    "Deribit perpetuals, 10-second bars, live over WebSocket. **P(violent)** = probability that "
-    "the next 5 minutes move at least twice the normal (30-minute) volatility. **Regime** = "
-    "rank of the 5-minute forecast among the training forecasts: CALM (lowest 25%), NORMAL, "
-    "ACTIVE, STRESSED (top 5%). **Spike** = last minute vs normal: elevated 2x, spike 3x."
+    "Deribit perpetuals, 10-second bars, live over WebSocket. **Stress** (0-100) = rank of the "
+    "forecast volatility of the next 5 minutes among the training forecasts; CALM below 25, "
+    "NORMAL to 75, ACTIVE to 95, STRESSED above. An alert is sent when stress reaches 99 or a "
+    "spike is under way, once per episode. **P(violent)** = probability that the next 5 "
+    "minutes move at least twice the normal (30-minute) volatility; about 3% on average."
 )
 
 if not instruments:
@@ -144,26 +145,28 @@ def render() -> None:
         )
         c = st.columns(7)
         c[0].metric("Price", price(s.price), bp(s.move_1m), help="change over the last minute")
-        c[6].metric(
-            "P(violent)",
-            pct(s.p_violent),
-            help="P(vol over the next 5 minutes >= 2x normal); about 3% on average",
-        )
         c[1].metric(
+            "Stress",
+            f"{s.stress:.1f}",
+            f"P(violent) {pct(s.p_violent)}",
+            delta_color="off",
+            help="0-100; alert at 99. P(violent) = P(next 5 min vol >= 2x normal)",
+        )
+        c[2].metric(
             "Next 5m vol",
             pct(s.forecast_vol),
             f"{s.forecast_ratio:.2f}x normal",
             delta_color="off",
             help="forecast, annualized",
         )
-        c[2].metric(
+        c[3].metric(
             "1 sd move, 5m", f"±{price(s.sigma_5m)}", help="one standard deviation, forecast"
         )
-        c[3].metric(
+        c[4].metric(
             "Vol 1m", pct(s.fast_vol), f"{s.ratio:.2f}x normal", delta_color="off", help="EWMA"
         )
-        c[4].metric("Normal vol", pct(s.slow_vol), help="EWMA, half-life 30 minutes")
-        c[5].metric("DVOL", pct(s.dvol), help="Deribit 30-day implied vol index")
+        c[5].metric("Normal vol", pct(s.slow_vol), help="EWMA, half-life 30 minutes")
+        c[6].metric("DVOL", pct(s.dvol), help="Deribit 30-day implied vol index")
         h = monitor.history(inst)
         h = h[(h.index >= h.index[-1] - pd.Timedelta(hours=hours)) & (h["regime"] >= 0)]
         st.plotly_chart(chart(h), width="stretch", key=f"chart-{inst}")
@@ -171,17 +174,18 @@ def render() -> None:
     alerts = monitor.alerts()
     st.subheader("Alerts")
     st.caption(
-        "regime = the forecast enters STRESSED · spike = the detector escalates · "
-        "history = found in the trades loaded at start-up, before the live feed"
+        "reason: forecast = stress reached the threshold; spike = a move is already under way. "
+        "history = found in the trades loaded at start-up, before the live feed."
     )
     if not alerts:
         st.caption("No alert since start.")
         return
     table = pd.DataFrame([a.as_dict() for a in reversed(alerts)])
     table["source"] = table.pop("live").map({True: "live", False: "history"})
-    table["change"] = table.pop("previous") + " → " + table.pop("level")
     table["time"] = pd.to_datetime(table["time"]).dt.strftime("%H:%M:%S")
-    for col in ("forecast_vol", "fast_vol", "slow_vol", "dvol"):
+    table["stress"] = table["stress"].map("{:.1f}".format)
+    table["sigma_5m"] = table["sigma_5m"].map(price)
+    for col in ("forecast_vol", "slow_vol", "dvol"):
         table[col] = table[col].map(pct)
     for col in ("forecast_ratio", "ratio"):
         table[col] = table[col].map("{:.2f}x".format)
@@ -191,15 +195,15 @@ def render() -> None:
         columns={
             "forecast_vol": "next 5m vol",
             "forecast_ratio": "next 5m / normal",
-            "fast_vol": "vol 1m",
             "ratio": "1m / normal",
+            "sigma_5m": "1 sd move, 5m",
             "slow_vol": "normal vol",
             "move_1m": "move 1m",
         }
     )
     table["p_violent"] = table["p_violent"].map(pct)
     table = table.rename(columns={"p_violent": "P(violent)"})
-    cols = ["time", "instrument", "kind", "change", "P(violent)", "next 5m vol"]
+    cols = ["time", "instrument", "reason", "stress", "P(violent)", "next 5m vol"]
     rest = [c for c in table.columns if c not in cols]
     st.dataframe(table[cols + rest], hide_index=True, width="stretch")
 

@@ -1,4 +1,4 @@
-"""Live monitor: five-minute forecast, P(violent), regime, and the spike detector.
+"""Live volatility-stress monitor: stress score, regime, and one alert when it starts.
 
 Start-up, replayed after a reconnection or a hole in the trade sequence:
 
@@ -36,7 +36,14 @@ from volengine.deribit.rest import DeribitREST
 from volengine.deribit.stream import DeribitStream, DvolUpdate, Event, Reconnected, Trade
 from volengine.detector import SECONDS_PER_YEAR, DetectorConfig, Level, SpikeDetector
 from volengine.features import HORIZON_SECONDS, VOL_WINDOWS
-from volengine.forecast import Forecast, Model, Regime, StreamingForecaster, default_model
+from volengine.forecast import (
+    Forecast,
+    Model,
+    Regime,
+    StreamingForecaster,
+    StressAlarm,
+    default_model,
+)
 from volengine.sampling import Bar, GridSampler
 
 log = logging.getLogger(__name__)
@@ -57,6 +64,7 @@ class Snapshot:
     forecast_ratio: float  # forecast vol over the next 5 minutes / normal vol
     forecast_vol: float  # the same, annualized
     p_violent: float  # P(vol next 5 minutes >= 2 x normal)
+    stress: float  # 0-100, percentile of the forecast among the training forecasts
     sigma_5m: float  # one-standard-deviation price move over the next 5 minutes
     level: Level  # spike detector: what is happening now
     ratio: float  # vol over the last minute / normal
@@ -70,21 +78,21 @@ class Snapshot:
 
 @dataclass(frozen=True)
 class Alert:
-    """``kind`` is "regime" (forecast enters STRESSED) or "spike" (detector escalates)."""
+    """Volatility is starting to pick up. ``reason`` is "forecast" (stress reached the
+    alarm threshold) or "spike" (a move is already under way)."""
 
     time: pd.Timestamp
     instrument: str
-    kind: str
-    previous: str
-    level: str
+    reason: str
+    stress: float
+    p_violent: float
     forecast_ratio: float
     forecast_vol: float
-    p_violent: float
-    ratio: float
-    fast_vol: float
-    slow_vol: float
+    sigma_5m: float
     price: float
     move_1m: float
+    ratio: float
+    slow_vol: float
     dvol: float | None
     live: bool = True  # False when found while replaying the start-up history
 
@@ -92,6 +100,21 @@ class Alert:
         d = {k: round(v, 6) if isinstance(v, float) else v for k, v in asdict(self).items()}
         d["time"] = self.time.isoformat()
         return d
+
+    @property
+    def title(self) -> str:
+        why = "forecast" if self.reason == "forecast" else "move under way"
+        return f"{self.instrument}: volatility stress {self.stress:.1f}/100 ({why})"
+
+    @property
+    def body(self) -> str:
+        move = "n/a" if math.isnan(self.move_1m) else f"{1e4 * self.move_1m:+.1f} bp"
+        return (
+            f"next 5 min: vol {100 * self.forecast_vol:.0f}% ({self.forecast_ratio:.2f}x normal), "
+            f"P(violent) {100 * self.p_violent:.0f}% (usual ~3%), 1 sd move "
+            f"{self.sigma_5m:,.2f} | price {self.price:,.2f}, last minute {move} | "
+            f"{self.time:%H:%M:%S} UTC"
+        )
 
 
 def _bar(start_ms: int, row) -> Bar:
@@ -101,8 +124,9 @@ def _bar(start_ms: int, row) -> Bar:
 
 
 class _State:
-    def __init__(self, config: DetectorConfig, model: Model):
+    def __init__(self, config: DetectorConfig, model: Model, alarm: StressAlarm):
         self.config = config
+        self.alarm = alarm
         self.sampler = GridSampler(config.bar_seconds)
         self.detector: SpikeDetector | None = None
         self.forecaster = StreamingForecaster(model, config)
@@ -113,7 +137,6 @@ class _State:
         self.warm: list[tuple[Bar, float]] = []
         self.level_since: float | None = None
         self.regime_since: float | None = None
-        self.regime_armed = True  # a regime alert re-arms once back to NORMAL or CALM
         self.last_close: float | None = None
         self.last_bar_ms: int | None = None
         self.last_seq: int | None = None
@@ -141,52 +164,46 @@ class _State:
         return []
 
     def _step(self, bar: Bar, r: float, report: bool = True) -> list[dict]:
-        changes = []
         end_s = (bar.start_ms + self.sampler.step) / 1000.0
         self.minute.append(bar.close)
         before = self.detector.level
         rd = self.detector.update(r)
         if rd.level != before or self.level_since is None:
             self.level_since = end_s
-        if rd.escalated:
-            changes.append(("spike", before.name.lower(), rd.level.name.lower()))
 
         self.forecaster.update(r, bar.n, bar.volume, bar.buy_volume, bar.liq_volume)
         old = self.forecast.regime if self.forecast is not None else None
         self.forecast = fc = self.forecaster.forecast(rd.slow_var, end_s)
-        if fc is not None:
-            if fc.regime != old or self.regime_since is None:
-                self.regime_since = end_s
-            if fc.regime <= Regime.NORMAL:
-                self.regime_armed = True
-            elif fc.regime == Regime.STRESSED and self.regime_armed and old is not None:
-                changes.append(("regime", old.name.lower(), "stressed"))
-                self.regime_armed = False
-        if not report or fc is None:
+        if fc is None:
+            return []
+        if fc.regime != old or self.regime_since is None:
+            self.regime_since = end_s
+        # The alarm runs during the warm-up too, so that it starts in the right state.
+        reason = self.alarm.update(fc.stress, end_s, rd.level >= Level.SPIKE)
+        if not report:
             return []
 
         ppy = self.config.bars_per_year
         fast, slow = math.sqrt(rd.fast_var * ppy), math.sqrt(rd.slow_var * ppy)
         row = (int(end_s * 1000), bar.close, fast, slow, rd.ratio, int(rd.level))
-        self.history.append((*row, fc.vol, fc.p_violent, int(fc.regime)))
+        self.history.append((*row, fc.vol, fc.p_violent, fc.stress, int(fc.regime)))
+        if reason is None:
+            return []
         full = len(self.minute) == self.minute.maxlen
-        move = math.log(bar.close / self.minute[0]) if full else float("nan")
         return [
             {
                 "time": pd.Timestamp(end_s, unit="s", tz="UTC"),
-                "kind": kind,
-                "previous": prev,
-                "level": new,
+                "reason": reason,
+                "stress": fc.stress,
+                "p_violent": fc.p_violent,
                 "forecast_ratio": fc.ratio,
                 "forecast_vol": fc.vol,
-                "p_violent": fc.p_violent,
-                "ratio": rd.ratio,
-                "fast_vol": fast,
-                "slow_vol": slow,
+                "sigma_5m": bar.close * fc.vol * math.sqrt(HORIZON_SECONDS / SECONDS_PER_YEAR),
                 "price": bar.close,
-                "move_1m": move,
+                "move_1m": math.log(bar.close / self.minute[0]) if full else float("nan"),
+                "ratio": rd.ratio,
+                "slow_vol": slow,
             }
-            for kind, prev, new in changes
         ]
 
 
@@ -198,14 +215,20 @@ class LiveMonitor:
         on_alert: Callable[[Alert], None] | None = None,
         models: dict[str, Model] | None = None,
         bar_store: BarStore | None = None,
+        threshold: float = 99.0,
+        spikes: bool = True,
     ):
-        """``models`` maps instruments to fitted models; defaults ship with the package."""
+        """``models`` maps instruments to fitted models; defaults ship with the package.
+
+        ``threshold`` (stress, 0-100) and ``spikes`` configure the alarm; see StressAlarm.
+        """
         self.config = config or DetectorConfig()
         instruments = list(instruments)
         models = models or {}
         self.models = {i: models.get(i) or default_model(i) for i in instruments}
         self.bar_store = bar_store or BarStore()
-        self._state = {i: _State(self.config, self.models[i]) for i in instruments}
+        self.alarm_settings = {"threshold": threshold, "spikes": spikes}
+        self._state = {i: self._new_state(i) for i in instruments}
         self._dvol: dict[str, float] = {}
         self._alerts: deque[Alert] = deque(maxlen=500)
         self._on_alert = on_alert
@@ -214,6 +237,9 @@ class LiveMonitor:
         self.seq_skipped = dict.fromkeys(instruments, 0)  # holes of block/combo trades only
         self._holes: list[tuple[str, int, int, int, int]] = []  # to check against REST
         self._resync = False
+
+    def _new_state(self, instrument: str) -> _State:
+        return _State(self.config, self.models[instrument], StressAlarm(**self.alarm_settings))
 
     @property
     def instruments(self) -> list[str]:
@@ -253,7 +279,7 @@ class LiveMonitor:
     def apply_seed(self, seed: dict) -> None:
         """Rebuild each instrument from loaded bars; escalations are kept with live=False."""
         for inst, (frames, trades) in seed.items():
-            st = _State(self.config, self.models[inst])
+            st = self._new_state(inst)
             parts = [f for f in frames if len(f)]
             if len(trades):
                 parts.append(build_bars(trades, self.config.bar_seconds))
@@ -277,8 +303,8 @@ class LiveMonitor:
                 st.last_seq = int(trades["trade_seq"].max())
             with self._lock:
                 self._state[inst] = st
-                known = {(a.instrument, a.time, a.kind) for a in self._alerts}
-                fresh = [a for a in replayed if (a.instrument, a.time, a.kind) not in known]
+                known = {(a.instrument, a.time) for a in self._alerts}
+                fresh = [a for a in replayed if (a.instrument, a.time) not in known]
                 merged = sorted([*self._alerts, *fresh], key=lambda a: a.time)
                 self._alerts = deque(merged, maxlen=self._alerts.maxlen)
             log.info("seeded %s, last trade_seq %s", inst, st.last_seq)
@@ -381,6 +407,7 @@ class LiveMonitor:
             forecast_ratio=fc.ratio,
             forecast_vol=fc.vol,
             p_violent=fc.p_violent,
+            stress=fc.stress,
             sigma_5m=price * fc.vol * math.sqrt(HORIZON_SECONDS / SECONDS_PER_YEAR),
             level=det.level,
             ratio=det.ratio,
@@ -408,7 +435,7 @@ class LiveMonitor:
         with self._lock:
             rows = list(self._state[instrument].history)
         cols = ["time", "price", "fast_vol", "slow_vol", "ratio", "level"]
-        cols += ["forecast_vol", "p_violent", "regime"]
+        cols += ["forecast_vol", "p_violent", "stress", "regime"]
         df = pd.DataFrame(rows, columns=cols)
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         return df.set_index("time")
