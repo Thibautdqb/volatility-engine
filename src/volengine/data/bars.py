@@ -78,7 +78,7 @@ class BarStore:
         if meta.exists() and json.loads(meta.read_text()).get("source") == info.fetched_at:
             return pq.read_table(base.with_suffix(".parquet")).to_pandas()
         cols = ["timestamp", "trade_seq", "price", "amount", "is_buy", "index_price"]
-        trades = self.trades.read_day(instrument, day, cols + ["liquidation", "kind"])
+        trades = self.trades.read_day(instrument, day, [*cols, "liquidation", "kind"])
         bars = build_bars(trades, bar_seconds)
         base.parent.mkdir(parents=True, exist_ok=True)
         tmp = base.with_suffix(".parquet.tmp")

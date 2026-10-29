@@ -9,6 +9,7 @@ previous day.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -134,7 +135,7 @@ def sync(
 
 def _check_boundaries(api, instrument, store, days, result) -> None:
     """Repair holes in the sequence numbers across midnight."""
-    for prev, nxt in zip(days, days[1:], strict=False):
+    for prev, nxt in itertools.pairwise(days):
         a, b = store.info(instrument, prev), store.info(instrument, nxt)
         if a is None or b is None or a.report["last_seq"] is None or b.report["first_seq"] is None:
             continue

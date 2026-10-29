@@ -93,9 +93,7 @@ class TradeStore:
         path = self._base(instrument, day).with_suffix(".parquet")
         return pq.read_table(path, columns=columns).to_pandas()
 
-    def read(
-        self, instrument: str, start, end, columns: list[str] | None = None
-    ) -> pd.DataFrame:
+    def read(self, instrument: str, start, end, columns: list[str] | None = None) -> pd.DataFrame:
         """Trades of the stored days in [start, end), sorted by trade_seq."""
         frames = [
             self.read_day(instrument, d, columns)
