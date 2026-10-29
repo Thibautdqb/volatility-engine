@@ -61,3 +61,4 @@ ignore = ["N803", "N806", "RUF002", "RUF003", "E741"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/*" = ["PD010"]  # unstack is the clearest way to lay out result tables
+"tests/test_xvenue.py" = ["E501"]  # raw exchange messages are kept on one line

@@ -283,6 +283,100 @@ def cmd_live(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cross-venue
+# ---------------------------------------------------------------------------
+
+
+def _engine_config(args):
+    from volengine.xvenue.engine import TAKER_FEES_BP, EngineConfig
+
+    fees = dict(TAKER_FEES_BP)
+    for item in args.fee or []:
+        market, _, bp = item.partition("=")
+        if market not in fees:
+            raise SystemExit(f"unknown market in --fee {item!r}; known: {', '.join(fees)}")
+        fees[market] = float(bp)
+    return EngineConfig(latency_ms=args.latency, z=args.z, fees_bp=fees)
+
+
+def cmd_xrecord(args) -> None:
+    from volengine.xvenue.record import ROOT, record
+
+    print(f"recording {', '.join(args.assets)} from all venues to {ROOT} (Ctrl-C to stop)")
+    try:
+        asyncio.run(record(tuple(args.assets), duration=args.duration))
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_xwatch(args) -> None:
+    from volengine.notify import Notifier
+    from volengine.xvenue.engine import Divergence, Engine, Opportunity
+    from volengine.xvenue.feeds import stream
+
+    config = _engine_config(args)
+    engine = Engine(tuple(args.assets), config=config)
+    notifier = Notifier(args.notify or ["terminal"])
+    print(
+        f"watching {', '.join(args.assets)} on deribit, binance (perp, spot), coinbase; "
+        f"flag when edge - fees > {config.z:g} sigma over {config.latency_ms:g} ms "
+        f"and net >= {args.min_net:g} bp; fees bp: {config.fees_bp}",
+        flush=True,
+    )
+
+    async def run() -> None:
+        last_status = 0.0
+        async for ev in stream(tuple(args.assets)):
+            for out in engine.on_event(ev):
+                if isinstance(out, Opportunity) and out.peak_net_bp >= args.min_net:
+                    title = (
+                        f"{out.asset}: sell {out.sell_on}, buy {out.buy_on}, "
+                        f"net {out.peak_net_bp:.2f} bp"
+                    )
+                    body = (
+                        f"edge {out.peak_edge_bp:.2f} bp vs normal, vol buffer "
+                        f"{out.buffer_bp:.2f} bp, {out.size:.4f} {out.asset} "
+                        f"(${out.notional_usd:,.0f}) available, lasted {out.duration_ms:.0f} ms"
+                    )
+                    notifier.send(out.__dict__, title, body)
+                elif isinstance(out, Divergence) and args.divergence:
+                    notifier.send(
+                        out.__dict__,
+                        f"{out.asset}: volatility rising on {out.leader} first",
+                        f"{out.sigma_leader_bp:.2f} bp/s vs {out.sigma_other_bp:.2f} on "
+                        f"{out.other}",
+                    )
+            if engine.now_ms - last_status >= 60_000 * args.status:
+                last_status = engine.now_ms
+                for asset in args.assets:
+                    rows = [r for r in engine.snapshot(asset) if "spread dev bp" in r]
+                    if rows:
+                        worst = max(rows, key=lambda r: abs(r["spread dev bp"]))
+                        print(
+                            f"[{pd.Timestamp(engine.now_ms, unit='ms'):%H:%M:%S} UTC] {asset}: "
+                            f"largest dislocation {worst['spread dev bp']:+.2f} bp "
+                            f"({worst['pair']}), episodes so far {len(engine.opportunities)}",
+                            flush=True,
+                        )
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_xstudy(args) -> None:
+    from volengine.xvenue.record import load
+    from volengine.xvenue.study import study
+
+    end = args.end or pd.Timestamp.now(tz="UTC")
+    df = load(args.start, end)
+    if df.empty:
+        raise SystemExit("nothing recorded in that range; run 'volengine xvenue record' first")
+    print(study(df, latency_ms=args.latency).summary())
+
+
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -354,6 +448,33 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--show-alerts", type=int, default=5, help="alerts listed under the table")
     lv.add_argument("--no-color", action="store_true")
     lv.set_defaults(func=cmd_live)
+    xv = sub.add_parser("xvenue", help="cross-venue dislocations and volatility divergence")
+    xsub = xv.add_subparsers(dest="xvenue_command", required=True)
+
+    def engine_args(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--latency", type=float, default=300.0, help="order round trip, ms")
+        q.add_argument("--z", type=float, default=2.0, help="volatility buffer, in sigmas")
+        q.add_argument(
+            "--fee", action="append", metavar="MARKET=BP", help="taker fee override, repeatable"
+        )
+
+    xr = xsub.add_parser("record", help="record quotes and trades of all venues to Parquet")
+    xr.add_argument("--assets", nargs="+", default=["BTC", "ETH"])
+    xr.add_argument("--duration", type=float, default=None, help="seconds (default: forever)")
+    xr.set_defaults(func=cmd_xrecord)
+    xw = xsub.add_parser("watch", help="flag dislocations live")
+    xw.add_argument("--assets", nargs="+", default=["BTC", "ETH"])
+    xw.add_argument("--min-net", type=float, default=0.0, help="only report net edges above, bp")
+    xw.add_argument("--divergence", action="store_true", help="also report vol divergences")
+    xw.add_argument("--notify", action="append", metavar="TARGET")
+    xw.add_argument("--status", type=float, default=5, help="minutes between status lines")
+    engine_args(xw)
+    xw.set_defaults(func=cmd_xwatch)
+    xs = xsub.add_parser("study", help="replay a recording and measure the flags")
+    xs.add_argument("--start", required=True)
+    xs.add_argument("--end", default=None)
+    xs.add_argument("--latency", type=float, default=300.0)
+    xs.set_defaults(func=cmd_xstudy)
     return p
 
 
