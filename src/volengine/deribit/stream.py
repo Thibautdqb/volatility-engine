@@ -32,7 +32,10 @@ class Trade:
     timestamp_ms: int  # exchange time
     price: float
     amount: float
-    trade_id: str = ""
+    trade_seq: int = 0  # increases by one per trade of the instrument
+    kind: str = "book"  # "book", "block" or "combo", as in data.schema
+    is_buy: bool = True
+    liquidation: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,15 +61,23 @@ def parse_message(message: dict) -> list[Event]:
     channel: str = params.get("channel", "")
     data = params.get("data")
     if channel.startswith("trades."):
+        # A notification batches up to 100 ms of trades; process them in matching order.
         return [
             Trade(
                 instrument=t["instrument_name"],
                 timestamp_ms=int(t["timestamp"]),
                 price=float(t["price"]),
                 amount=float(t["amount"]),
-                trade_id=str(t["trade_id"]),
+                trade_seq=int(t["trade_seq"]),
+                kind="block"
+                if t.get("block_trade_id")
+                else "combo"
+                if t.get("combo_id")
+                else "book",
+                is_buy=t.get("direction") == "buy",
+                liquidation=bool(t.get("liquidation")),
             )
-            for t in data
+            for t in sorted(data, key=lambda t: t["trade_seq"])
         ]
     if channel.startswith("deribit_volatility_index."):
         return [

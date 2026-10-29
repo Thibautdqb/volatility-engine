@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "volengine"
-version = "0.2.0"
+version = "0.3.0"
 description = "Five-minute volatility forecast, market-regime classifier and spike detector for Deribit BTC and ETH perpetuals, evaluated out of sample."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,7 @@ dependencies = [
     "scipy>=1.11",
     "httpx>=0.27",
     "websockets>=12.0",
+    "pyarrow>=15.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
     "matplotlib>=3.8",
+    "statsmodels>=0.14",
 ]
 
 [project.scripts]
@@ -56,3 +58,6 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "NPY", "PD", "RUF"]
 ignore = ["N803", "N806", "RUF002", "RUF003", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["PD010"]  # unstack is the clearest way to lay out result tables

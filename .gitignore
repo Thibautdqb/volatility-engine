@@ -9,4 +9,4 @@ dist/
 .coverage
 .ipynb_checkpoints/
 .streamlit/secrets.toml
-data/
+/data/

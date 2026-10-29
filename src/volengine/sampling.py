@@ -1,98 +1,70 @@
-"""Sample a trade tape on a regular time grid.
+"""Streaming counterpart of :func:`volengine.data.bars.build_bars`.
 
-A bar's price is the last trade printed inside it; a bar without trades keeps the
-previous price (zero return). Bars are aligned on the epoch and identified by their
-integer index ``timestamp_ms // bar_ms``. The streaming :class:`GridSampler` and the
-batch :func:`bar_closes` produce identical series from the same trades, so the live
-monitor and the historical study measure exactly the same thing.
+Same rules: order-book trades only, taken in ``trade_seq`` order, late prints (stamped
+in a bar that has already closed) ignored, and a bar without trades keeps the previous
+close. Bars are identified by their start time in milliseconds.
 """
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+from dataclasses import dataclass
+
+from volengine.data.bars import bar_ms
 
 
-def bar_ms(bar_seconds: float) -> int:
-    ms = round(bar_seconds * 1000)
-    if ms <= 0:
-        raise ValueError("bar_seconds must be positive")
-    return ms
-
-
-def bar_closes(
-    trades: pd.DataFrame,
-    bar_seconds: float,
-    start: pd.Timestamp | None = None,
-    end: pd.Timestamp | None = None,
-) -> pd.Series:
-    """Last trade price per bar over [start, end), forward-filled across empty bars.
-
-    ``trades`` needs ``timestamp`` (ms) and ``price`` columns, in time order. Bars before
-    the first trade are dropped.
-    """
-    step = bar_ms(bar_seconds)
-    ts = trades["timestamp"].to_numpy(dtype=np.int64)
-    bucket = ts // step
-    last = pd.Series(trades["price"].to_numpy(dtype=float)).groupby(bucket).last()
-    lo = bucket[0] if start is None else int(pd.Timestamp(start).timestamp() * 1000) // step
-    hi = bucket[-1] + 1 if end is None else -(-int(pd.Timestamp(end).timestamp() * 1000) // step)
-    closes = last.reindex(np.arange(lo, hi)).ffill().dropna()
-    closes.index = pd.to_datetime(closes.index.to_numpy() * step, unit="ms", utc=True)
-    closes.index.name = "time"
-    return closes
-
-
-def log_returns(closes: pd.Series) -> pd.Series:
-    return np.log(closes).diff().dropna()
+@dataclass
+class Bar:
+    start_ms: int
+    close: float
+    n: int = 0
+    volume: float = 0.0
+    buy_volume: float = 0.0
+    liq_volume: float = 0.0
 
 
 class GridSampler:
-    """Streaming equivalent of :func:`bar_closes`.
-
-    ``bucket`` and ``close`` resume from a known state (e.g. after seeding from
-    history): trades in buckets before ``bucket`` are ignored, and if no trade arrives
-    in ``bucket`` the bar closes at ``close``.
-    """
+    """Build bars from trades; ``bucket``/``close`` resume from a known state."""
 
     def __init__(self, bar_seconds: float, bucket: int | None = None, close: float | None = None):
         self.step = bar_ms(bar_seconds)
-        self.bucket = bucket
-        self.close = close
-        self.trades = 0  # trades in the bar in progress
+        self.current: Bar | None = None
+        if bucket is not None and close is not None:
+            self.current = Bar(bucket * self.step, close)
 
-    def _roll(self, new_bucket: int) -> list[tuple[int, float, int]]:
-        done = [(self.bucket * self.step, self.close, self.trades)]
+    @property
+    def close(self) -> float | None:
+        return self.current.close if self.current else None
+
+    def _roll(self, bucket: int) -> list[Bar]:
+        cur = self.current
+        done = [cur]
         # Empty bars between the last one and the new one keep the last price.
-        done.extend((b * self.step, self.close, 0) for b in range(self.bucket + 1, new_bucket))
-        self.bucket, self.trades = new_bucket, 0
+        start = cur.start_ms // self.step
+        done.extend(Bar(b * self.step, cur.close) for b in range(start + 1, bucket))
+        self.current = Bar(bucket * self.step, cur.close)
         return done
 
-    def update(self, timestamp_ms: int, price: float) -> list[tuple[int, float, int]]:
-        """Add a trade; returns completed bars as ``(start_ms, close, n_trades)``."""
-        b = timestamp_ms // self.step
-        if self.bucket is None or self.close is None:
-            self.bucket, self.close, self.trades = b, price, 1
-            return []
-        if b < self.bucket:  # late print or already covered by history
-            return []
-        done = self._roll(b) if b > self.bucket else []
-        self.close = price
-        self.trades += 1
+    def update(
+        self, timestamp_ms: int, price: float, amount: float, is_buy: bool, liquidation: bool
+    ) -> list[Bar]:
+        """Add a book trade (in trade_seq order); returns the bars it completed."""
+        bucket = timestamp_ms // self.step
+        if self.current is None:
+            self.current = Bar(bucket * self.step, price)
+        elif bucket < self.current.start_ms // self.step:
+            return []  # late print
+        done = self._roll(bucket) if bucket > self.current.start_ms // self.step else []
+        bar = self.current
+        bar.close = price
+        bar.n += 1
+        bar.volume += amount
+        bar.buy_volume += amount if is_buy else 0.0
+        bar.liq_volume += amount if liquidation else 0.0
         return done
 
-    def advance(self, now_ms: int) -> list[tuple[int, float, int]]:
+    def advance(self, now_ms: int) -> list[Bar]:
         """Close every bar that ended before ``now_ms``, even if no trade arrived since."""
-        if self.bucket is None or self.close is None:
+        if self.current is None:
             return []
-        b = now_ms // self.step
-        return self._roll(b) if b > self.bucket else []
-
-
-def bar_counts(trades: pd.DataFrame, closes: pd.Series, bar_seconds: float) -> pd.Series:
-    """Number of trades in each bar of ``closes`` (zero for empty bars)."""
-    step = bar_ms(bar_seconds)
-    n = pd.Series(1, index=trades["timestamp"].to_numpy(dtype=np.int64) // step).groupby(level=0)
-    n = n.sum()
-    n.index = pd.to_datetime(n.index.to_numpy() * step, unit="ms", utc=True)
-    return n.reindex(closes.index).fillna(0).astype(int)
+        bucket = now_ms // self.step
+        return self._roll(bucket) if bucket > self.current.start_ms // self.step else []
